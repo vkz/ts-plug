@@ -32,26 +32,26 @@ ts-unplug-proxy -dir <state-dir> (-socks5 <listen:port> | -http <listen:port>) [
 
 Start a SOCKS5 proxy:
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080
-curl --socks5-hostname localhost:1080 http://myserver.tailnet.ts.net
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080
+curl --socks5-hostname 127.0.0.1:1080 http://myserver.tailnet.ts.net
 ```
 
 For SOCKS5, use `socks5h://` or `--socks5-hostname` so the client sends the hostname to the proxy. Tailnet names are resolved from Tailscale status/DNS; public names fall back to normal tsnet egress.
 
 Start an HTTP proxy:
 ```sh
-ts-unplug-proxy -dir ./state -http localhost:8080
-curl -x http://localhost:8080 http://myserver.tailnet.ts.net
+ts-unplug-proxy -dir ./state -http 127.0.0.1:8080
+curl -x http://127.0.0.1:8080 http://myserver.tailnet.ts.net
 ```
 
 Start both on different ports:
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080 -http localhost:8080
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:8080
 ```
 
 Start both on the same port:
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080 -http localhost:1080
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:1080
 ```
 
 ## Configuration Flags
@@ -70,12 +70,12 @@ ts-unplug-proxy -dir ./state -socks5 localhost:1080 -http localhost:1080
 
 - `-v` - Log proxy connections and proxy dials
   ```sh
-  ts-unplug-proxy -dir ./state -v -socks5 localhost:1080
+  ts-unplug-proxy -dir ./state -v -socks5 127.0.0.1:1080
   ```
 
 - `-vv` - Log proxy connections, proxy dials, and `tsnet.Server` debug info
   ```sh
-  ts-unplug-proxy -dir ./state -vv -socks5 localhost:1080
+  ts-unplug-proxy -dir ./state -vv -socks5 127.0.0.1:1080
   ```
 
 - `-accept-routes` - Accept subnet and Tailscale Service routes advertised by other nodes
@@ -86,11 +86,11 @@ ts-unplug-proxy -dir ./state -socks5 localhost:1080 -http localhost:1080
 
 - `-pac-domain <a,b>` - Comma-separated tailnet DNS suffixes the PAC must never send `DIRECT`. Defaults to the MagicDNS name recorded in `-dir`.
 
-- `-disable-exit-node` - Do not auto-select a tailnet exit node. See [Exit nodes and the persistence trap](#exit-nodes-and-the-persistence-trap).
+- `-exit-node` - Use a tailnet exit node for non-tailnet egress. Off by default. See [Exit nodes and persisted prefs](#exit-nodes-and-persisted-prefs).
 
 - `-clear-exit-node` - One-shot: clear a persisted exit-node preference from `-dir`, then exit. Stop the proxy first.
 
-- `-direct` - Dial non-tailnet destinations directly via the OS instead of through tsnet. Off by default; this sends traffic outside the tailnet.
+- `-direct` - Force non-tailnet names through the OS resolver and dialer. Off by default and rarely needed: without an exit node, non-tailnet traffic already egresses via the OS. Does not apply to IP literals.
 
 - `-allow-non-loopback` - Allow `-socks5`/`-http`/`-pac-addr` to bind non-loopback addresses. Off by default.
 
@@ -110,6 +110,13 @@ Then set the browser's automatic proxy configuration URL to
 `http://127.0.0.1:8099/proxy.pac` (on macOS,
 `networksetup -setautoproxyurl "Wi-Fi" http://127.0.0.1:8099/proxy.pac`).
 
+The PAC is served as soon as the process binds its listeners, before tsnet has
+connected, so a browser never falls back to `DIRECT` because the PAC was
+momentarily unavailable. While tsnet connects, tailnet requests queue rather
+than leaking. `GET /status` on the same address returns a JSON health document
+(`ready`, `backend_state`, `route_all`, `exit_node`, `suffixes`, `proxies`,
+`version`).
+
 The PAC fails closed: any host under a configured suffix or `.ts.net`, and any
 literal address in `100.64.0.0/10` (Tailscale node IPs and Service VIPs), is
 sent to the proxy and never to `DIRECT`. Only unmatched hosts fall through to
@@ -122,12 +129,12 @@ DNS lookup.
 
 ## Exit nodes and persisted prefs
 
-Unless `-disable-exit-node` is set, startup enables automatic exit-node
-selection. `tsnet.Up` **replaces the persisted prefs with defaults on every
-start** (`ipn.NewPrefs()` plus hostname/WantRunning/ControlURL), so the choice is
-not carried across runs: pass `-accept-routes` and the exit-node preference on
-every invocation. A previously persisted exit-node selection is cleared on the
-next start, even with `-disable-exit-node`.
+Exit nodes are opt-in (`-exit-node`). `tsnet.Up` **replaces the persisted prefs
+with defaults on every start** (`ipn.NewPrefs()` plus
+hostname/WantRunning/ControlURL), so the choice is not carried across runs: pass
+`-accept-routes` and the exit-node preference on every invocation. A previously
+persisted exit-node selection is cleared on the next start, even without
+`-exit-node`.
 
 `-clear-exit-node` scrubs a persisted selection from the state file *without*
 starting tsnet (for example before handing the directory to another tool), and
@@ -162,35 +169,35 @@ It reports:
 
 Use SOCKS5 hostname mode so the tailnet DNS name is sent to the proxy:
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080
-curl --socks5-hostname localhost:1080 http://api-staging.tailnet.ts.net
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080
+curl --socks5-hostname 127.0.0.1:1080 http://api-staging.tailnet.ts.net
 ```
 
 For proxy URLs, use `socks5h://` rather than `socks5://` when the client supports it:
 ```sh
-ALL_PROXY=socks5h://localhost:1080 curl http://api-staging.tailnet.ts.net
+ALL_PROXY=socks5h://127.0.0.1:1080 curl http://api-staging.tailnet.ts.net
 ```
 
 ### HTTP Proxy With curl
 
 ```sh
-ts-unplug-proxy -dir ./state -http localhost:8080
-curl -x http://localhost:8080 http://api-staging.tailnet.ts.net
+ts-unplug-proxy -dir ./state -http 127.0.0.1:8080
+curl -x http://127.0.0.1:8080 http://api-staging.tailnet.ts.net
 ```
 
 HTTPS through the HTTP proxy uses CONNECT:
 ```sh
-curl -x http://localhost:8080 https://api-staging.tailnet.ts.net
+curl -x http://127.0.0.1:8080 https://api-staging.tailnet.ts.net
 ```
 
 ### Browser Proxy
 
 Start one or both proxy listeners:
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080 -http localhost:8080
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:8080
 ```
 
-Configure your browser to use either SOCKS host `localhost:1080` or HTTP proxy `localhost:8080`.
+Configure your browser to use either SOCKS host `127.0.0.1:1080` or HTTP proxy `127.0.0.1:8080`.
 
 ## How It Works
 
@@ -230,7 +237,7 @@ The proxy does not use the local OS resolver for tailnet hostnames received from
 
 ### Local Binding
 
-Use a loopback listen address such as `localhost:1080` or `127.0.0.1:1080` unless you intentionally want other machines to use the proxy.
+Use a loopback listen address such as `127.0.0.1:1080` unless you intentionally want other machines to use the proxy. Non-loopback binds are refused unless `-allow-non-loopback` is passed.
 
 ### Authentication
 
@@ -249,15 +256,15 @@ chmod 700 ./state
 
 At least one proxy listener is required:
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080
-ts-unplug-proxy -dir ./state -http localhost:8080
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080
+ts-unplug-proxy -dir ./state -http 127.0.0.1:8080
 ```
 
 ### Tailnet DNS Does Not Resolve With SOCKS5
 
 Use SOCKS5 hostname mode:
 ```sh
-curl --socks5-hostname localhost:1080 http://myserver.tailnet.ts.net
+curl --socks5-hostname 127.0.0.1:1080 http://myserver.tailnet.ts.net
 ```
 
 For proxy URLs, use `socks5h://` rather than `socks5://` when the client supports it:
@@ -269,7 +276,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl http://myserver.tailnet.ts.net
 
 ```sh
 lsof -i :1080
-ts-unplug-proxy -dir ./state -socks5 localhost:1081
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1081
 ```
 
 ### Can't Reach Remote Service

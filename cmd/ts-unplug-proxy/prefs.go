@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"tailscale.com/atomicfile"
 )
 
 // stateFileName is the tsnet state file inside -dir. tsnet's FileStore keeps a
@@ -186,20 +188,12 @@ func (s *stateFile) clearExitNode() ([]string, error) {
 	return changed, nil
 }
 
-// save writes the state file atomically (temp file + rename), matching tsnet's
-// 0600 permissions.
+// save writes the state file atomically (temp file, fsync, rename), matching
+// tsnet's 0600 permissions.
 func (s *stateFile) save() error {
 	bs, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, bs, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.WriteFile(s.path, bs, 0o600)
 }

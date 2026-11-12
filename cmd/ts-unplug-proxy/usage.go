@@ -19,13 +19,14 @@ WHY THIS EXISTS
   hosts from a browser or CLI without installing tailscaled.
 
 USAGE
-  ts-unplug-proxy -dir <state-dir> (-socks5 <addr> | -http <addr> | -pac-addr <addr>) [options]
+  ts-unplug-proxy -dir <state-dir> (-socks5 <addr> | -http <addr>) [-pac-addr <addr>] [options]
   ts-unplug-proxy doctor -dir <state-dir> [-socks5 <addr>] [-http <addr>] [-pac-addr <addr>]
   ts-unplug-proxy -dir <state-dir> -clear-exit-node
   ts-unplug-proxy -version
 
-  At least one listener is required to serve. Proxy clients choose the
-  destination; this command does not take a remote address argument.
+  At least one of -socks5 or -http is required to serve; a PAC alone has
+  nothing to route to. Proxy clients choose the destination; this command does
+  not take a remote address argument.
 
 LISTENERS
   -socks5 <addr>   SOCKS5 proxy. Clients must send the hostname (curl
@@ -34,8 +35,11 @@ LISTENERS
   -http  <addr>    HTTP proxy (absolute-form requests and CONNECT tunnels).
                    CONNECT always carries the hostname, so this is the safest
                    choice for browsers.
-  -pac-addr <addr> Serve /proxy.pac on this address. The PAC sends tailnet
-                   hosts to the proxy and everything else DIRECT.
+  -pac-addr <addr> Serve /proxy.pac (and GET /status, a JSON health document)
+                   on this address. The PAC sends tailnet hosts to the proxy
+                   and everything else DIRECT. It is served before tsnet
+                   connects, so a browser never falls back to DIRECT because
+                   the PAC was momentarily unavailable.
 
 ROUTING AND RESOLUTION
   -dir <path>                    tsnet state directory (required). Holds the
@@ -46,23 +50,25 @@ ROUTING AND RESOLUTION
   -accept-routes                 Accept advertised subnet routes and Tailscale
                                  Service VIPs (sets RouteAll). Required to reach
                                  Services or hosts behind subnet routers.
-  -direct                        Dial non-tailnet destinations directly via the
-                                 OS instead of through tsnet. Off by default.
-                                 RISK: this sends traffic outside the tailnet.
+  -direct                        Force non-tailnet names through the OS resolver
+                                 and dialer. Off by default, and rarely needed:
+                                 without an exit node, non-tailnet traffic
+                                 already egresses via the OS.
   -disable-interface-binding     Disable Tailscale's network-namespace interface
                                  binding. Needed on macOS when another tunnel
                                  (WARP) owns interface/route selection.
-  -disable-exit-node             Do not auto-select a tailnet exit node.
+  -exit-node                     Use a tailnet exit node for non-tailnet egress.
+                                 Off by default: tailnet-host access only.
   -clear-exit-node               One-shot: clear a persisted exit-node
                                  preference from -dir, then exit. Stop the
                                  proxy first (the state file has no lock).
 
 EXIT NODES (READ THIS)
-  Unless -disable-exit-node is set, startup enables automatic exit-node
-  selection. tsnet.Up replaces the persisted prefs with defaults on every
-  start, so this choice (like -accept-routes) is NOT carried across runs: pass
-  the flags you want on every invocation, and a previously persisted selection
-  is cleared on the next start. 'doctor' reports a persisted exit-node pref, and
+  Exit nodes are opt-in (-exit-node). tsnet.Up replaces the persisted prefs
+  with defaults on every start, so this choice (like -accept-routes) is NOT
+  carried across runs: pass the flags you want on every invocation, and a
+  previously persisted selection is cleared on the next start. 'doctor'
+  reports a persisted exit-node pref, and
   'ts-unplug-proxy -dir <state-dir> -clear-exit-node' scrubs the state file
   without starting tsnet (stop the proxy first; the file has no lock).
 
@@ -102,7 +108,7 @@ EXAMPLES
   ts-unplug-proxy -dir ~/.local/state/ts-unplug-proxy \
     -socks5 127.0.0.1:1080 -http 127.0.0.1:8080 \
     -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net \
-    -disable-interface-binding -accept-routes -disable-exit-node
+    -disable-interface-binding -accept-routes
 
   # Diagnose the state dir, listeners, PAC and routes
   ts-unplug-proxy doctor -dir ~/.local/state/ts-unplug-proxy \

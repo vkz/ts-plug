@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"strings"
 	"time"
 
+	"tailscale.com/client/local"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/views"
@@ -120,7 +121,6 @@ func (d *doctor) checkState() {
 }
 
 func (d *doctor) checkListeners() {
-	configured := false
 	for _, l := range []struct{ flag, addr string }{
 		{"-socks5", d.socksAddr},
 		{"-http", d.httpAddr},
@@ -129,7 +129,6 @@ func (d *doctor) checkListeners() {
 		if l.addr == "" {
 			continue
 		}
-		configured = true
 		switch {
 		case isLoopbackListenAddr(l.addr):
 			d.ok("%s %s is loopback-only", l.flag, l.addr)
@@ -139,8 +138,8 @@ func (d *doctor) checkListeners() {
 			d.fail("%s %s is NOT loopback and -allow-non-loopback is not set", l.flag, l.addr)
 		}
 	}
-	if !configured {
-		d.fail("no listener configured (-socks5, -http, or -pac-addr)")
+	if d.socksAddr == "" && d.httpAddr == "" {
+		d.fail("no -socks5 or -http listener configured (a PAC alone has nothing to route to)")
 	}
 }
 
@@ -200,10 +199,14 @@ func (d *doctor) checkRoutes() {
 		d.warn("skipping route check: no -dir")
 		return
 	}
-	if isListening(d.socksAddr) || isListening(d.httpAddr) {
-		d.warn("a proxy listener is active; skipping online route check (it would rewrite %s)", stateFilePath(d.dir))
+	// The state file has no cross-process lock, so a second tsnet on the same
+	// node key would corrupt it. Refuse while a proxy holds the dir lock.
+	lock, err := lockDir(d.dir)
+	if err != nil {
+		d.warn("state dir is in use by a running proxy; skipping online route check (%v)", err)
 		return
 	}
+	defer lock.Close()
 	// tsnet.Up replaces the persisted prefs with defaults (Hostname, WantRunning,
 	// ControlURL, ...), so probing with a second tsnet.Server would mutate the
 	// state dir. Snapshot the prefs bytes and restore them when done.
@@ -231,9 +234,9 @@ func (d *doctor) checkRoutes() {
 			d.warn("no local client: %v", err)
 			return
 		}
-		status, err := lc.Status(ctx)
-		if err != nil {
-			d.warn("status failed: %v", err)
+		status := d.waitForNetmap(ctx, lc)
+		if status == nil {
+			d.warn("status unavailable; route check skipped")
 			return
 		}
 		if status.Self != nil {
@@ -301,6 +304,31 @@ func (d *doctor) restorePrefs(key string, raw []byte, ok bool) {
 	d.info("restored tsnet-managed prefs after route probe")
 }
 
+// waitForNetmap polls until the network map has been applied (self is in it),
+// so peer routes are populated. Reading Status immediately after Up races the
+// netmap and can report no routes. Bounded to 15s.
+func (d *doctor) waitForNetmap(ctx context.Context, lc *local.Client) *ipnstate.Status {
+	deadline := time.Now().Add(15 * time.Second)
+	var last *ipnstate.Status
+	for {
+		st, err := lc.Status(ctx)
+		if err == nil {
+			last = st
+			if st.Self != nil && st.Self.InNetworkMap {
+				return st
+			}
+		}
+		if time.Now().After(deadline) {
+			return last
+		}
+		select {
+		case <-ctx.Done():
+			return last
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 func isTailnetPrefix(p netip.Prefix) bool {
 	addr := p.Masked().Addr()
 	if addr.Is4() {
@@ -323,19 +351,4 @@ func prefixList(s *views.Slice[netip.Prefix]) []netip.Prefix {
 		return nil
 	}
 	return s.AsSlice()
-}
-
-// isListening reports whether a TCP connection to addr succeeds. Non-loopback
-// bind addresses are probed on loopback.
-func isListening(addr string) bool {
-	if addr == "" {
-		return false
-	}
-	target := pacAdvertiseAddr(addr)
-	c, err := net.DialTimeout("tcp", target, 300*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	c.Close()
-	return true
 }

@@ -38,11 +38,11 @@ var (
 	flagHTTPAddr                = flag.String("http", "", "HTTP proxy listen address")
 	flagPACAddr                 = flag.String("pac-addr", "", "serve /proxy.pac on this listen address")
 	flagPACDomains              = flag.String("pac-domain", "", "comma-separated tailnet DNS suffixes the PAC must never send DIRECT (default: MagicDNS name from -dir)")
-	flagNoExitNode              = flag.Bool("disable-exit-node", false, "disable automatic tailnet exit node use")
+	flagExitNode                = flag.Bool("exit-node", false, "use a tailnet exit node for non-tailnet egress (off by default)")
 	flagClearExitNode           = flag.Bool("clear-exit-node", false, "one-shot: clear a persisted exit-node preference from -dir, then exit")
 	flagDisableInterfaceBinding = flag.Bool("disable-interface-binding", false, "disable Tailscale's macOS network namespace integration")
 	flagAcceptRoutes            = flag.Bool("accept-routes", false, "accept advertised subnet and Service routes")
-	flagDirect                  = flag.Bool("direct", false, "dial non-tailnet destinations directly via the OS instead of through tsnet (off by default)")
+	flagDirect                  = flag.Bool("direct", false, "force non-tailnet names through the OS resolver/dialer (rarely needed; off by default)")
 	flagAllowNonLoopback        = flag.Bool("allow-non-loopback", false, "allow -socks5/-http/-pac-addr to bind non-loopback addresses")
 	flagVersion                 = flag.Bool("version", false, "print version and build information, then exit")
 )
@@ -53,9 +53,10 @@ type serveResult struct {
 }
 
 type tailnetDialer struct {
-	ts     *tsnet.Server
-	lc     *local.Client
-	direct bool
+	ts       *tsnet.Server
+	lc       *local.Client
+	direct   bool
+	suffixes []string
 }
 
 type loggingListener struct {
@@ -98,6 +99,12 @@ func main() {
 		os.Exit(1)
 	}
 	if *flagClearExitNode {
+		lock, err := lockDir(*flagDir)
+		if err != nil {
+			slog.Error("cannot clear exit-node preference", slog.Any("error", err))
+			os.Exit(1)
+		}
+		defer lock.Close()
 		if err := clearExitNode(*flagDir); err != nil {
 			slog.Error("failed to clear exit-node preference", slog.Any("error", err))
 			os.Exit(1)
@@ -135,6 +142,76 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// One tsnet server per state dir: the state file has no cross-process lock.
+	lock, err := lockDir(*flagDir)
+	if err != nil {
+		slog.Error("cannot use state dir", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer lock.Close()
+
+	serveErr := make(chan serveResult, 3)
+	var closers []io.Closer
+	closeAll := func() {
+		for _, c := range closers {
+			if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				slog.Warn("error closing listener", slog.Any("error", err))
+			}
+		}
+	}
+	defer closeAll()
+
+	// Bind listeners and serve the PAC before tsnet starts. The PAC is static,
+	// so it is available immediately; tailnet requests then queue (fail closed)
+	// while the node comes up instead of the browser falling back to DIRECT
+	// because it could not fetch the PAC.
+	status := &statusState{suffixes: pacDomains, proxies: pacProxies(*flagSOCKS5Addr, *flagHTTPAddr)}
+	if *flagPACAddr != "" {
+		listener, err := net.Listen("tcp", *flagPACAddr)
+		if err != nil {
+			slog.Error("failed to listen for PAC", slog.String("addr", *flagPACAddr), slog.Any("error", err))
+			os.Exit(1)
+		}
+		closers = append(closers, listener)
+		cfg := pacConfig{suffixes: pacDomains, proxies: status.proxies}
+		startPACServer(listener, cfg.script(), status, verboseProxy, serveErr)
+		slog.Info("PAC listening",
+			slog.String("local", listener.Addr().String()),
+			slog.String("url", "http://"+listener.Addr().String()+"/proxy.pac"),
+			slog.String("suffixes", strings.Join(cfg.effectiveSuffixes(), ", ")),
+		)
+	}
+
+	var socksListener, httpListener net.Listener
+	if *flagSOCKS5Addr != "" && *flagSOCKS5Addr == *flagHTTPAddr {
+		listener, err := net.Listen("tcp", *flagSOCKS5Addr)
+		if err != nil {
+			slog.Error("failed to listen", slog.String("addr", *flagSOCKS5Addr), slog.Any("error", err))
+			os.Exit(1)
+		}
+		closers = append(closers, listener)
+		socksListener, httpListener = proxymux.SplitSOCKSAndHTTP(listener)
+	} else {
+		if *flagSOCKS5Addr != "" {
+			listener, err := net.Listen("tcp", *flagSOCKS5Addr)
+			if err != nil {
+				slog.Error("failed to listen for SOCKS5", slog.String("addr", *flagSOCKS5Addr), slog.Any("error", err))
+				os.Exit(1)
+			}
+			closers = append(closers, listener)
+			socksListener = listener
+		}
+		if *flagHTTPAddr != "" {
+			listener, err := net.Listen("tcp", *flagHTTPAddr)
+			if err != nil {
+				slog.Error("failed to listen for HTTP proxy", slog.String("addr", *flagHTTPAddr), slog.Any("error", err))
+				os.Exit(1)
+			}
+			closers = append(closers, listener)
+			httpListener = listener
+		}
+	}
+
 	ts := &tsnet.Server{
 		Hostname: tsnetHostname,
 		Dir:      *flagDir,
@@ -151,7 +228,7 @@ func main() {
 		netns.SetEnabled(false)
 	}
 
-	st, err := ts.Up(ctx)
+	upStatus, err := ts.Up(ctx)
 	if err != nil {
 		slog.Error("error starting tsnet server", slog.Any("error", err))
 		os.Exit(1)
@@ -162,7 +239,7 @@ func main() {
 		}
 	}()
 
-	slog.Info("tsnet server started", slog.String("status", st.BackendState))
+	slog.Info("tsnet server started", slog.String("status", upStatus.BackendState))
 
 	lc, err := ts.LocalClient()
 	if err != nil {
@@ -179,84 +256,34 @@ func main() {
 		}
 		slog.Info("advertised subnet and Service routes enabled")
 	}
-	if !*flagNoExitNode {
+	if *flagExitNode {
 		if err := useExitNodeIfAvailable(ctx, lc); err != nil {
 			slog.Warn("failed to configure tailnet exit node", slog.Any("error", err))
 		}
 	}
-	dialer := (&tailnetDialer{ts: ts, lc: lc, direct: *flagDirect}).Dial
+	dialer := (&tailnetDialer{ts: ts, lc: lc, direct: *flagDirect, suffixes: pacDomains}).Dial
 
-	serveErr := make(chan serveResult, 3)
-	var closers []io.Closer
-
-	if *flagSOCKS5Addr != "" && *flagSOCKS5Addr == *flagHTTPAddr {
-		listener, err := net.Listen("tcp", *flagSOCKS5Addr)
-		if err != nil {
-			slog.Error("failed to listen", slog.String("addr", *flagSOCKS5Addr), slog.Any("error", err))
-			os.Exit(1)
-		}
-		closers = append(closers, listener)
-
-		socksListener, httpListener := proxymux.SplitSOCKSAndHTTP(listener)
+	// tsnet is up; start serving the already-bound proxy listeners.
+	if socksListener != nil {
+		ln := socksListener
 		if verboseProxy {
-			socksListener = loggingListener{Listener: socksListener, proxy: "socks5"}
-			httpListener = loggingListener{Listener: httpListener, proxy: "http"}
+			ln = loggingListener{Listener: ln, proxy: "socks5"}
 		}
-		startSOCKS5Proxy(socksListener, dialer, serveErr)
-		startHTTPProxy(httpListener, dialer, serveErr)
-		slog.Info("SOCKS5 and HTTP proxies listening", slog.String("local", listener.Addr().String()))
-	} else {
-		if *flagSOCKS5Addr != "" {
-			listener, err := net.Listen("tcp", *flagSOCKS5Addr)
-			if err != nil {
-				slog.Error("failed to listen for SOCKS5", slog.String("addr", *flagSOCKS5Addr), slog.Any("error", err))
-				os.Exit(1)
-			}
-			closers = append(closers, listener)
-			if verboseProxy {
-				listener = loggingListener{Listener: listener, proxy: "socks5"}
-			}
-			startSOCKS5Proxy(listener, dialer, serveErr)
-			slog.Info("SOCKS5 proxy listening", slog.String("local", listener.Addr().String()))
-		}
-		if *flagHTTPAddr != "" {
-			listener, err := net.Listen("tcp", *flagHTTPAddr)
-			if err != nil {
-				slog.Error("failed to listen for HTTP proxy", slog.String("addr", *flagHTTPAddr), slog.Any("error", err))
-				os.Exit(1)
-			}
-			closers = append(closers, listener)
-			if verboseProxy {
-				listener = loggingListener{Listener: listener, proxy: "http"}
-			}
-			startHTTPProxy(listener, dialer, serveErr)
-			slog.Info("HTTP proxy listening", slog.String("local", listener.Addr().String()))
-		}
+		startSOCKS5Proxy(ln, dialer, serveErr)
+		slog.Info("SOCKS5 proxy listening", slog.String("local", ln.Addr().String()))
 	}
-
-	if *flagPACAddr != "" {
-		listener, err := net.Listen("tcp", *flagPACAddr)
-		if err != nil {
-			slog.Error("failed to listen for PAC", slog.String("addr", *flagPACAddr), slog.Any("error", err))
-			os.Exit(1)
+	if httpListener != nil {
+		ln := httpListener
+		if verboseProxy {
+			ln = loggingListener{Listener: ln, proxy: "http"}
 		}
-		closers = append(closers, listener)
-		cfg := pacConfig{suffixes: pacDomains, proxies: pacProxies(*flagSOCKS5Addr, *flagHTTPAddr)}
-		startPACServer(listener, cfg.script(), verboseProxy, serveErr)
-		slog.Info("PAC listening",
-			slog.String("local", listener.Addr().String()),
-			slog.String("url", "http://"+listener.Addr().String()+"/proxy.pac"),
-			slog.String("suffixes", strings.Join(cfg.effectiveSuffixes(), ", ")),
-		)
+		startHTTPProxy(ln, dialer, serveErr)
+		slog.Info("HTTP proxy listening", slog.String("local", ln.Addr().String()))
 	}
+	status.setReady(ctx, upStatus.BackendState, lc)
 
 	select {
 	case <-ctx.Done():
-		for _, closer := range closers {
-			if err := closer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				slog.Warn("error closing listener", slog.Any("error", err))
-			}
-		}
 	case result := <-serveErr:
 		if result.err != nil && !errors.Is(result.err, net.ErrClosed) && !errors.Is(result.err, http.ErrServerClosed) {
 			slog.Error("proxy stopped with error", slog.String("proxy", result.name), slog.Any("error", result.err))
@@ -349,7 +376,7 @@ func (d *tailnetDialer) resolveAddr(ctx context.Context, network, addr string) (
 		}
 	}
 	if err != nil {
-		if isStrictTailnetHost(status, host) {
+		if d.isStrictTailnetHost(status, host) {
 			return "", false, fmt.Errorf("tailnet DNS lookup for %q: %w", host, err)
 		}
 		slog.Debug("tailnet DNS lookup failed; falling back to normal tsnet dial",
@@ -359,7 +386,7 @@ func (d *tailnetDialer) resolveAddr(ctx context.Context, network, addr string) (
 		return "", false, nil
 	}
 	if len(ips) == 0 {
-		if isStrictTailnetHost(status, host) {
+		if d.isStrictTailnetHost(status, host) {
 			return "", false, fmt.Errorf("tailnet DNS lookup for %q returned no addresses", host)
 		}
 		return "", false, nil
@@ -457,14 +484,15 @@ func magicDNSSuffixes(status *ipnstate.Status) []string {
 	return suffixes
 }
 
-func isStrictTailnetHost(status *ipnstate.Status, host string) bool {
+func (d *tailnetDialer) isStrictTailnetHost(status *ipnstate.Status, host string) bool {
 	hostKey := dnsMapKey(host)
 	if !strings.Contains(hostKey, ".") {
 		return true
 	}
-	for _, suffix := range magicDNSSuffixes(status) {
+	suffixes := append(append([]string{}, magicDNSSuffixes(status)...), d.suffixes...)
+	for _, suffix := range suffixes {
 		suffixKey := dnsMapKey(suffix)
-		if hostKey == suffixKey || strings.HasSuffix(hostKey, "."+suffixKey) {
+		if suffixKey != "" && (hostKey == suffixKey || strings.HasSuffix(hostKey, "."+suffixKey)) {
 			return true
 		}
 	}

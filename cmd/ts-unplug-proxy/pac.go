@@ -63,16 +63,23 @@ func (c pacConfig) script() string {
 	b.WriteString("  }\n")
 	b.WriteString("  return true;\n")
 	b.WriteString("}\n")
+	b.WriteString("function normalizeHost(h) {\n")
+	b.WriteString("  h = h.toLowerCase();\n")
+	b.WriteString("  if (h.length > 1 && h.charAt(h.length - 1) === \".\") h = h.slice(0, -1);\n")
+	b.WriteString("  if (h.length > 1 && h.charAt(0) === \"[\" && h.charAt(h.length - 1) === \"]\") h = h.slice(1, -1);\n")
+	b.WriteString("  return h;\n")
+	b.WriteString("}\n")
 	b.WriteString("var tsnetSuffixes = [" + jsStringList(c.effectiveSuffixes()) + "];\n")
 	b.WriteString("var tsnetProxies = \"" + c.proxyList() + "\";\n")
 	b.WriteString("function FindProxyForURL(url, host) {\n")
-	b.WriteString("  host = host.toLowerCase();\n")
+	b.WriteString("  host = normalizeHost(host);\n")
 	b.WriteString("  for (var i = 0; i < tsnetSuffixes.length; i++) {\n")
 	b.WriteString("    var d = tsnetSuffixes[i];\n")
 	b.WriteString("    if (host === d || dnsDomainIs(host, \".\" + d)) return tsnetProxies;\n")
 	b.WriteString("  }\n")
 	b.WriteString("  // isInNet() only runs for IP literals, so hostnames never trigger a PAC DNS lookup.\n")
 	b.WriteString("  if (isIpLiteral(host) && isInNet(host, \"100.64.0.0\", \"255.192.0.0\")) return tsnetProxies;\n")
+	b.WriteString("  if (host.indexOf(\":\") !== -1 && host.indexOf(\"fd7a:115c:a1e0:\") === 0) return tsnetProxies;\n")
 	b.WriteString("  return \"DIRECT\";\n")
 	b.WriteString("}\n")
 	return b.String()
@@ -82,13 +89,19 @@ func (c pacConfig) script() string {
 // without a JavaScript engine.
 func (c pacConfig) match(host string) string {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
 	for _, d := range c.effectiveSuffixes() {
 		if host == d || strings.HasSuffix(host, "."+d) {
 			return c.proxyList()
 		}
 	}
-	if ip, err := netip.ParseAddr(host); err == nil && ip.Is4() && cgnatPrefix.Contains(ip) {
-		return c.proxyList()
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is4() && cgnatPrefix.Contains(ip) {
+			return c.proxyList()
+		}
+		if ip.Is6() && tailnetV6.Contains(ip) {
+			return c.proxyList()
+		}
 	}
 	return "DIRECT"
 }
@@ -101,8 +114,9 @@ func jsStringList(items []string) string {
 	return strings.Join(quoted, ", ")
 }
 
-// startPACServer serves the PAC file on an already-created listener.
-func startPACServer(listener net.Listener, script string, verbose bool, serveErr chan<- serveResult) {
+// startPACServer serves the PAC file and a JSON status document on an
+// already-created listener.
+func startPACServer(listener net.Listener, script string, status *statusState, verbose bool, serveErr chan<- serveResult) {
 	mux := http.NewServeMux()
 	serve := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
@@ -112,6 +126,7 @@ func startPACServer(listener net.Listener, script string, verbose bool, serveErr
 		}
 	}
 	mux.HandleFunc("/proxy.pac", serve)
+	mux.HandleFunc("/status", statusHandler(status))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

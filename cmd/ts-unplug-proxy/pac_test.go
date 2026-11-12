@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -30,7 +31,8 @@ func TestPACMatchFailClosed(t *testing.T) {
 		{"wild-dojo.ts.net", "proxy"},
 		{"gxa.wild-dojo.ts.net", "proxy"},
 		{"GXA.WILD-DOJO.TS.NET.", "proxy"},
-		{"foo.ts.net", "proxy"}, // any ts.net fails closed
+		{"gxa.wild-dojo.ts.net.", "proxy"}, // trailing dot
+		{"foo.ts.net", "proxy"},            // any ts.net fails closed
 		{"funnel-host.ts.net", "proxy"},
 		{"100.64.0.0", "proxy"},
 		{"100.64.1.1", "proxy"},
@@ -39,6 +41,10 @@ func TestPACMatchFailClosed(t *testing.T) {
 		{"100.128.0.0", "direct"},
 		{"example.com", "direct"},
 		{"10.0.0.1", "direct"},
+		{"fd7a:115c:a1e0::1", "proxy"},   // tailnet IPv6
+		{"[fd7a:115c:a1e0::1]", "proxy"}, // bracketed IPv6
+		{"fd7a:115c:a1e1::1", "direct"},
+		{"2606:4700::1", "direct"},
 	}
 	for _, tc := range cases {
 		if got := kind(cfg.match(tc.host)); got != tc.want {
@@ -54,6 +60,8 @@ func TestPACScriptRules(t *testing.T) {
 		`"ts.net"`,
 		`isInNet(host, "100.64.0.0", "255.192.0.0")`,
 		`isIpLiteral(host)`,
+		`normalizeHost`,
+		`fd7a:115c:a1e0:`,
 		`return tsnetProxies;`,
 		`return "DIRECT";`,
 	} {
@@ -64,6 +72,51 @@ func TestPACScriptRules(t *testing.T) {
 	// The suffix/CGNAT checks must come before the DIRECT fallback.
 	if strings.Index(script, `return tsnetProxies;`) > strings.Index(script, `return "DIRECT";`) {
 		t.Error("PAC script falls through to DIRECT before the tailnet checks")
+	}
+}
+
+// TestPACScriptWithNode evaluates the generated JavaScript with a real engine
+// and standard PAC shims, so a mismatch between the script and the Go mirror is
+// caught. It is skipped when node is unavailable.
+func TestPACScriptWithNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not found; skipping JS PAC evaluation")
+	}
+	hosts := []string{
+		"wild-dojo.ts.net", "gxa.wild-dojo.ts.net", "GXA.WILD-DOJO.TS.NET.",
+		"gxa.wild-dojo.ts.net.", "foo.ts.net", "funnel-host.ts.net",
+		"100.64.0.0", "100.64.1.1", "100.127.255.255", "100.63.255.255",
+		"100.128.0.0", "example.com", "10.0.0.1",
+		"fd7a:115c:a1e0::1", "[fd7a:115c:a1e0::1]", "fd7a:115c:a1e1::1", "2606:4700::1",
+	}
+	harness := `
+function dnsDomainIs(host, domain) {
+  return host.length > domain.length && host.substring(host.length - domain.length) === domain;
+}
+function isInNet(ip, pattern, mask) {
+  function toInt(s) { var p = s.split("."); return ((+p[0]) << 24) | ((+p[1]) << 16) | ((+p[2]) << 8) | (+p[3]); }
+  return (toInt(ip) & toInt(mask)) === (toInt(pattern) & toInt(mask));
+}
+` + testPAC().script() + `
+var hosts = [` + jsStringList(hosts) + `];
+hosts.forEach(function(h) { console.log(h + " " + FindProxyForURL("https://" + h + "/", h)); });
+`
+	out, err := exec.Command(node, "-e", harness).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node failed: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if parts := strings.SplitN(line, " ", 2); len(parts) == 2 {
+			got[parts[0]] = kind(parts[1])
+		}
+	}
+	for _, h := range hosts {
+		want := kind(testPAC().match(h))
+		if got[h] != want {
+			t.Errorf("PAC script %s -> %s, Go mirror says %s", h, got[h], want)
+		}
 	}
 }
 

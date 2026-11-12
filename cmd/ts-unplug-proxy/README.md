@@ -18,21 +18,21 @@ make ts-unplug-proxy
 Or install directly (module path is `github.com/vkz/ts-plug`):
 
 ```sh
-go install github.com/vkz/ts-plug/cmd/ts-unplug-proxy@latest
+go install github.com/vkz/ts-plug/cmd/ts-unplug-proxy@v0.1.0
 ```
 
 ## Usage
 
 ```sh
-ts-unplug-proxy -dir ./state -socks5 localhost:1080
-curl --socks5-hostname localhost:1080 http://myserver.tailnet-name.ts.net
+ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080
+curl --socks5-hostname 127.0.0.1:1080 http://myserver.tailnet-name.ts.net
 ```
 
 `socks5h://` and `--socks5-hostname` send the hostname to the proxy. Tailnet hostnames are resolved from Tailscale status/DNS instead of local DNS; public names fall back to normal tsnet egress.
 
 ```sh
-ts-unplug-proxy -dir ./state -http localhost:8080
-curl -x http://localhost:8080 http://myserver.tailnet-name.ts.net
+ts-unplug-proxy -dir ./state -http 127.0.0.1:8080
+curl -x http://127.0.0.1:8080 http://myserver.tailnet-name.ts.net
 ```
 
 Proxy clients provide the remote destination, so this command does not take a positional remote address.
@@ -48,7 +48,7 @@ Use `-pac-addr` to serve a PAC file from the same process; browsers then send on
 ts-unplug-proxy -dir ~/.local/state/ts-unplug-proxy \
   -socks5 127.0.0.1:1080 -http 127.0.0.1:8080 \
   -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net \
-  -disable-interface-binding -accept-routes -disable-exit-node
+  -disable-interface-binding -accept-routes
 
 # diagnose state, listeners, PAC and routes
 ts-unplug-proxy doctor -dir ~/.local/state/ts-unplug-proxy -http 127.0.0.1:8080
