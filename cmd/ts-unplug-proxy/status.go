@@ -15,19 +15,31 @@ import (
 type statusState struct {
 	mu       sync.Mutex
 	lc       *local.Client
+	serving  bool
 	suffixes []string
 	proxies  []string
+}
+
+// setServing marks the SOCKS/HTTP proxies as accepting. /status only reports
+// HTTP 200 once the backend is Running AND this is set, so a health check does
+// not pass while listeners are bound but not yet serving.
+func (s *statusState) setServing() {
+	s.mu.Lock()
+	s.serving = true
+	s.mu.Unlock()
 }
 
 func (s *statusState) snapshot(ctx context.Context) map[string]any {
 	s.mu.Lock()
 	lc := s.lc
+	serving := s.serving
 	suffixes := s.suffixes
 	proxies := s.proxies
 	s.mu.Unlock()
 
 	out := map[string]any{
 		"ready":         false,
+		"serving":       serving,
 		"backend_state": "",
 		"auth_url":      "",
 		"route_all":     false,
@@ -62,7 +74,9 @@ func statusHandler(s *statusState) http.HandlerFunc {
 		snap := s.snapshot(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		if ready, _ := snap["ready"].(bool); !ready {
+		ready, _ := snap["ready"].(bool)
+		serving, _ := snap["serving"].(bool)
+		if !ready || !serving {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		enc := json.NewEncoder(w)

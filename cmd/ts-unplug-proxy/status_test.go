@@ -8,9 +8,9 @@ import (
 )
 
 func TestStatusHandlerReadiness(t *testing.T) {
-	// No LocalClient yet: not ready, so the health check returns 503.
 	s := &statusState{suffixes: []string{"wild-dojo.ts.net"}, proxies: []string{"PROXY 127.0.0.1:8080"}}
 
+	// No LocalClient yet and not serving: 503.
 	rec := httptest.NewRecorder()
 	statusHandler(s)(rec, httptest.NewRequest("GET", "/status", nil))
 	if rec.Code != 503 {
@@ -20,20 +20,34 @@ func TestStatusHandlerReadiness(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body["ready"] != false {
-		t.Errorf("ready = %v, want false", body["ready"])
+	if body["ready"] != false || body["serving"] != false {
+		t.Errorf("ready/serving = %v/%v, want false/false", body["ready"], body["serving"])
 	}
 	for _, key := range []string{"backend_state", "auth_url", "route_all", "exit_node", "suffixes", "proxies", "version"} {
 		if _, ok := body[key]; !ok {
 			t.Errorf("status body missing %q", key)
 		}
 	}
+
+	// Serving but no client (backend not Running): still 503.
+	s.setServing()
+	rec = httptest.NewRecorder()
+	statusHandler(s)(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != 503 {
+		t.Errorf("serving without client: code = %d, want 503", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["serving"] != true {
+		t.Errorf("serving = %v, want true", body["serving"])
+	}
 }
 
 func TestStatusSnapshotNoClient(t *testing.T) {
 	s := &statusState{}
 	snap := s.snapshot(context.Background())
-	if snap["ready"] != false {
-		t.Errorf("ready = %v, want false", snap["ready"])
+	if snap["ready"] != false || snap["serving"] != false {
+		t.Errorf("ready/serving = %v/%v, want false/false", snap["ready"], snap["serving"])
 	}
 }

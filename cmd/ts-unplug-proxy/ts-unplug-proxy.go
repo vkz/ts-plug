@@ -287,6 +287,8 @@ func main() {
 		startHTTPProxy(ln, dialer, serveErr)
 		slog.Info("HTTP proxy listening", slog.String("local", ln.Addr().String()))
 	}
+	status.setServing()
+
 	select {
 	case <-ctx.Done():
 	case result := <-serveErr:
