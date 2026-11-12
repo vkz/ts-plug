@@ -1,4 +1,4 @@
-module github.com/tailscale/ts-plug
+module github.com/vkz/ts-plug
 
 go 1.27.3
 
