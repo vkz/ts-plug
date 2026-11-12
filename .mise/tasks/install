@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#MISE description="Build ts-unplug-proxy from this checkout (dev path; prefer the mise go: tool for installs)"
+#USAGE flag "-h --help" help="Print help"
+#USAGE flag "-d --dest <dir>" help="Output directory" default="~/.local/bin"
+set -euo pipefail
+
+if [ "${usage_help:-false}" = "true" ]; then
+  mise tasks info install
+  exit 0
+fi
+
+dest="${usage_dest:-${DEST:-$HOME/.local/bin}}"
+# Expand a leading ~ without relying on shell tilde rules.
+dest="${dest/#\~/$HOME}"
+
+mkdir -p "$dest"
+go build -o "$dest/ts-unplug-proxy" ./cmd/ts-unplug-proxy
+echo "installed $dest/ts-unplug-proxy"

@@ -15,6 +15,12 @@ cd ../..
 make ts-unplug-proxy
 ```
 
+Or install directly (module path is `github.com/vkz/ts-plug`):
+
+```sh
+go install github.com/vkz/ts-plug/cmd/ts-unplug-proxy@latest
+```
+
 ## Usage
 
 ```sh
@@ -34,6 +40,19 @@ Proxy clients provide the remote destination, so this command does not take a po
 Use `-v` to log proxy connections. Use `-vv` to include `tsnet.Server` debug logs.
 
 Use `-accept-routes` when reaching subnet routes or Tailscale Services advertised by other nodes. On macOS, use `-disable-interface-binding` when another network tunnel controls the system's interface and route selection.
+
+Use `-pac-addr` to serve a PAC file from the same process; browsers then send only tailnet hosts through the proxy and everything else `DIRECT`. See **[docs/ts-unplug-proxy.md](../../docs/ts-unplug-proxy.md)** for the full flag reference, the exit-node persistence trap, and the `doctor` subcommand.
+
+```sh
+# SOCKS5 + HTTP proxy + PAC for a machine behind another tunnel
+ts-unplug-proxy -dir ~/.local/state/ts-unplug-proxy \
+  -socks5 127.0.0.1:1080 -http 127.0.0.1:8080 \
+  -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net \
+  -disable-interface-binding -accept-routes -disable-exit-node
+
+# diagnose state, listeners, PAC and routes
+ts-unplug-proxy doctor -dir ~/.local/state/ts-unplug-proxy -http 127.0.0.1:8080
+```
 
 ## Documentation
 

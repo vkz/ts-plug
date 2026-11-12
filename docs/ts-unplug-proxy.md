@@ -82,6 +82,80 @@ ts-unplug-proxy -dir ./state -socks5 localhost:1080 -http localhost:1080
 
 - `-disable-interface-binding` - On macOS, disable Tailscale's network namespace integration, including physical-interface binding. Use this when another network tunnel controls the system's interface and route selection.
 
+- `-pac-addr <addr>` - Serve `/proxy.pac` on this address (loopback only). Browsers that use the PAC send only tailnet hosts through the proxy.
+
+- `-pac-domain <a,b>` - Comma-separated tailnet DNS suffixes the PAC must never send `DIRECT`. Defaults to the MagicDNS name recorded in `-dir`.
+
+- `-disable-exit-node` - Do not auto-select a tailnet exit node. See [Exit nodes and the persistence trap](#exit-nodes-and-the-persistence-trap).
+
+- `-clear-exit-node` - One-shot: clear a persisted exit-node preference from `-dir`, then exit. Stop the proxy first.
+
+- `-direct` - Dial non-tailnet destinations directly via the OS instead of through tsnet. Off by default; this sends traffic outside the tailnet.
+
+- `-allow-non-loopback` - Allow `-socks5`/`-http`/`-pac-addr` to bind non-loopback addresses. Off by default.
+
+- `-version` - Print version and build information, then exit.
+
+## Browser setup with a PAC file
+
+Serve the PAC from the same process and point the browser (or the system proxy) at it:
+
+```sh
+ts-unplug-proxy -dir ./state \
+  -socks5 127.0.0.1:1080 -http 127.0.0.1:8080 \
+  -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net
+```
+
+Then set the browser's automatic proxy configuration URL to
+`http://127.0.0.1:8099/proxy.pac` (on macOS,
+`networksetup -setautoproxyurl "Wi-Fi" http://127.0.0.1:8099/proxy.pac`).
+
+The PAC fails closed: any host under a configured suffix or `.ts.net`, and any
+literal address in `100.64.0.0/10` (Tailscale node IPs and Service VIPs), is
+sent to the proxy and never to `DIRECT`. Only unmatched hosts fall through to
+`DIRECT`. `isInNet` runs only for IP literals, so hostnames never trigger a PAC
+DNS lookup.
+
+> `ts.net` is on the browser HSTS preload list, so plain `http://host.ts.net`
+> is upgraded to HTTPS by Chrome/Safari/Firefox. Terminate TLS on the tailnet
+> host (for example with `tailscale serve`) if you need browser access.
+
+## Exit nodes and persisted prefs
+
+Unless `-disable-exit-node` is set, startup enables automatic exit-node
+selection. `tsnet.Up` **replaces the persisted prefs with defaults on every
+start** (`ipn.NewPrefs()` plus hostname/WantRunning/ControlURL), so the choice is
+not carried across runs: pass `-accept-routes` and the exit-node preference on
+every invocation. A previously persisted exit-node selection is cleared on the
+next start, even with `-disable-exit-node`.
+
+`-clear-exit-node` scrubs a persisted selection from the state file *without*
+starting tsnet (for example before handing the directory to another tool), and
+`doctor` reports one when present:
+
+```sh
+ts-unplug-proxy -dir ./state -clear-exit-node
+```
+
+## Diagnosing with `doctor`
+
+`doctor` inspects the state dir, listeners, PAC and routes, and exits non-zero
+on problems. It reads prefs offline and only opens tsnet for the route check
+when no proxy listener is active (the state file has no cross-process lock).
+
+```sh
+ts-unplug-proxy doctor -dir ./state \
+  -http 127.0.0.1:8080 -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net
+```
+
+It reports:
+
+- the MagicDNS suffix and the effective prefs (warns/fails on a persisted exit node),
+- whether every listener is loopback-only,
+- the exact PAC decisions for sample hosts (tailnet, CGNAT, and public),
+- advertised routes, and accepted routes with a warning when `RouteAll` pulls
+  in non-tailnet (corporate) CIDRs.
+
 ## Examples
 
 ### SOCKS5 With curl

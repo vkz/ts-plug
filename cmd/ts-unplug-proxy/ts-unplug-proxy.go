@@ -36,9 +36,15 @@ var (
 	flagVerboseTSNet            = flag.Bool("vv", false, "log proxy connections and tsnet debug info")
 	flagSOCKS5Addr              = flag.String("socks5", "", "SOCKS5 proxy listen address")
 	flagHTTPAddr                = flag.String("http", "", "HTTP proxy listen address")
+	flagPACAddr                 = flag.String("pac-addr", "", "serve /proxy.pac on this listen address")
+	flagPACDomains              = flag.String("pac-domain", "", "comma-separated tailnet DNS suffixes the PAC must never send DIRECT (default: MagicDNS name from -dir)")
 	flagNoExitNode              = flag.Bool("disable-exit-node", false, "disable automatic tailnet exit node use")
+	flagClearExitNode           = flag.Bool("clear-exit-node", false, "one-shot: clear a persisted exit-node preference from -dir, then exit")
 	flagDisableInterfaceBinding = flag.Bool("disable-interface-binding", false, "disable Tailscale's macOS network namespace integration")
 	flagAcceptRoutes            = flag.Bool("accept-routes", false, "accept advertised subnet and Service routes")
+	flagDirect                  = flag.Bool("direct", false, "dial non-tailnet destinations directly via the OS instead of through tsnet (off by default)")
+	flagAllowNonLoopback        = flag.Bool("allow-non-loopback", false, "allow -socks5/-http/-pac-addr to bind non-loopback addresses")
+	flagVersion                 = flag.Bool("version", false, "print version and build information, then exit")
 )
 
 type serveResult struct {
@@ -47,8 +53,9 @@ type serveResult struct {
 }
 
 type tailnetDialer struct {
-	ts *tsnet.Server
-	lc *local.Client
+	ts     *tsnet.Server
+	lc     *local.Client
+	direct bool
 }
 
 type loggingListener struct {
@@ -70,25 +77,55 @@ func (ln loggingListener) Accept() (net.Conn, error) {
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s -dir <state-dir> (-socks5 <listen:port> | -http <listen:port>) [options]\n\n", os.Args[0])
-		fmt.Fprintln(flag.CommandLine.Output(), "Starts local SOCKS5 and/or HTTP proxies that dial destinations through a tsnet.Server.")
-		fmt.Fprintln(flag.CommandLine.Output())
-		flag.PrintDefaults()
+	doctorMode := false
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		doctorMode = true
+		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
-
+	flag.Usage = printUsage
 	flag.Parse()
-	if *flagDir == "" {
-		slog.Error("dir is required")
-		os.Exit(1)
+
+	if *flagVersion {
+		printVersion()
+		return
 	}
-	if *flagSOCKS5Addr == "" && *flagHTTPAddr == "" {
-		slog.Error("at least one of -socks5 or -http is required")
+	if *flagDir == "" {
+		slog.Error("-dir is required")
 		os.Exit(1)
 	}
 	if flag.NArg() != 0 {
 		slog.Error("positional remote addresses are not supported; proxy clients provide destinations")
 		os.Exit(1)
+	}
+	if *flagClearExitNode {
+		if err := clearExitNode(*flagDir); err != nil {
+			slog.Error("failed to clear exit-node preference", slog.Any("error", err))
+			os.Exit(1)
+		}
+		return
+	}
+	if doctorMode {
+		os.Exit(runDoctor())
+	}
+	if *flagSOCKS5Addr == "" && *flagHTTPAddr == "" {
+		slog.Error("at least one of -socks5 or -http is required")
+		os.Exit(1)
+	}
+	if err := checkLoopbackListeners(); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	pacDomains := splitCommaList(*flagPACDomains)
+	if *flagPACAddr != "" && len(pacDomains) == 0 {
+		if sf, err := loadStateFile(*flagDir); err == nil {
+			if n := sf.magicDNSName(); n != "" {
+				pacDomains = []string{n}
+			}
+		}
+		if len(pacDomains) == 0 {
+			slog.Error("-pac-addr requires -pac-domain (could not derive a MagicDNS suffix from -dir)")
+			os.Exit(1)
+		}
 	}
 	verboseProxy := *flagVerboseProxy || *flagVerboseTSNet
 	if verboseProxy {
@@ -147,9 +184,9 @@ func main() {
 			slog.Warn("failed to configure tailnet exit node", slog.Any("error", err))
 		}
 	}
-	dialer := (&tailnetDialer{ts: ts, lc: lc}).Dial
+	dialer := (&tailnetDialer{ts: ts, lc: lc, direct: *flagDirect}).Dial
 
-	serveErr := make(chan serveResult, 2)
+	serveErr := make(chan serveResult, 3)
 	var closers []io.Closer
 
 	if *flagSOCKS5Addr != "" && *flagSOCKS5Addr == *flagHTTPAddr {
@@ -195,6 +232,22 @@ func main() {
 			startHTTPProxy(listener, dialer, serveErr)
 			slog.Info("HTTP proxy listening", slog.String("local", listener.Addr().String()))
 		}
+	}
+
+	if *flagPACAddr != "" {
+		listener, err := net.Listen("tcp", *flagPACAddr)
+		if err != nil {
+			slog.Error("failed to listen for PAC", slog.String("addr", *flagPACAddr), slog.Any("error", err))
+			os.Exit(1)
+		}
+		closers = append(closers, listener)
+		cfg := pacConfig{suffixes: pacDomains, proxies: pacProxies(*flagSOCKS5Addr, *flagHTTPAddr)}
+		startPACServer(listener, cfg.script(), verboseProxy, serveErr)
+		slog.Info("PAC listening",
+			slog.String("local", listener.Addr().String()),
+			slog.String("url", "http://"+listener.Addr().String()+"/proxy.pac"),
+			slog.String("suffixes", strings.Join(cfg.effectiveSuffixes(), ", ")),
+		)
 	}
 
 	select {
@@ -247,6 +300,14 @@ func (d *tailnetDialer) Dial(ctx context.Context, network, addr string) (net.Con
 		return nil, err
 	}
 	if !resolved {
+		if d.direct {
+			var nd net.Dialer
+			slog.Debug("dialing directly (bypassing tailnet)",
+				slog.String("network", network),
+				slog.String("addr", addr),
+			)
+			return nd.DialContext(dialCtx, network, addr)
+		}
 		slog.Debug("dialing through tailnet with original host",
 			slog.String("network", network),
 			slog.String("addr", addr),
@@ -591,4 +652,76 @@ func httpProxyHandler(dialer func(context.Context, string, string) (net.Conn, er
 		}()
 		<-errc
 	})
+}
+
+// splitCommaList splits a comma-separated flag value, dropping blanks.
+func splitCommaList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// isLoopbackListenAddr reports whether a listen address is restricted to the
+// loopback interface. An empty host (":8080") means all interfaces and is not
+// loopback.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// checkLoopbackListeners refuses non-loopback listeners unless the operator
+// opted in with -allow-non-loopback.
+func checkLoopbackListeners() error {
+	if *flagAllowNonLoopback {
+		return nil
+	}
+	for _, l := range []struct{ flag, addr string }{
+		{"-socks5", *flagSOCKS5Addr},
+		{"-http", *flagHTTPAddr},
+		{"-pac-addr", *flagPACAddr},
+	} {
+		if l.addr != "" && !isLoopbackListenAddr(l.addr) {
+			return fmt.Errorf("refusing non-loopback listener %s %s without -allow-non-loopback", l.flag, l.addr)
+		}
+	}
+	return nil
+}
+
+// clearExitNode clears a persisted exit-node preference from the state dir.
+// The state file has no cross-process lock, so the proxy must be stopped.
+func clearExitNode(dir string) error {
+	sf, err := loadStateFile(dir)
+	if err != nil {
+		return err
+	}
+	changed, err := sf.clearExitNode()
+	if err != nil {
+		return err
+	}
+	if len(changed) == 0 {
+		slog.Info("no persisted exit-node preference to clear", slog.String("dir", dir))
+		return nil
+	}
+	slog.Info("cleared persisted exit-node preference",
+		slog.String("dir", dir),
+		slog.String("fields", strings.Join(changed, ",")),
+	)
+	return nil
 }
