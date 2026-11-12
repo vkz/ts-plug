@@ -148,7 +148,7 @@ ts-unplug-proxy -dir ./state -clear-exit-node
 
 `doctor` inspects the state dir, listeners, PAC and routes, and exits non-zero
 on problems. It reads prefs offline and only opens tsnet for the route check
-when no proxy listener is active (the state file has no cross-process lock).
+when it can take the state-dir lock (i.e. the proxy is not running).
 
 ```sh
 ts-unplug-proxy doctor -dir ./state \

@@ -61,7 +61,7 @@ ROUTING AND RESOLUTION
                                  Off by default: tailnet-host access only.
   -clear-exit-node               One-shot: clear a persisted exit-node
                                  preference from -dir, then exit. Stop the
-                                 proxy first (the state file has no lock).
+                                 proxy first (it holds the state-dir lock).
 
 EXIT NODES (READ THIS)
   Exit nodes are opt-in (-exit-node). tsnet.Up replaces the persisted prefs
@@ -70,7 +70,8 @@ EXIT NODES (READ THIS)
   previously persisted selection is cleared on the next start. 'doctor'
   reports a persisted exit-node pref, and
   'ts-unplug-proxy -dir <state-dir> -clear-exit-node' scrubs the state file
-  without starting tsnet (stop the proxy first; the file has no lock).
+  without starting tsnet (stop the proxy first; it holds
+  <dir>/ts-unplug-proxy.lock).
 
 PAC BEHAVIOUR (FAIL CLOSED)
   /proxy.pac returns the proxy list for:

@@ -9,58 +9,57 @@ import (
 	"tailscale.com/client/local"
 )
 
-// statusState is the live state reported by GET /status on the PAC listener.
-// It is populated before tsnet starts (ready=false) and refreshed once the
-// node is up, so a health check can distinguish "listening" from "connected".
+// statusState backs GET /status. The backend state is read live from the
+// LocalClient on every request (via StatusWithoutPeers), so the endpoint
+// reports NeedsLogin/Stopped and the auth URL rather than a cached snapshot.
 type statusState struct {
 	mu       sync.Mutex
-	ready    bool
-	state    string
-	exitNode string
-	routeAll bool
+	lc       *local.Client
 	suffixes []string
 	proxies  []string
 }
 
-func (s *statusState) setReady(ctx context.Context, backendState string, lc *local.Client) {
+func (s *statusState) snapshot(ctx context.Context) map[string]any {
 	s.mu.Lock()
-	s.ready = true
-	s.state = backendState
+	lc := s.lc
+	suffixes := s.suffixes
+	proxies := s.proxies
 	s.mu.Unlock()
-	if lc == nil {
-		return
-	}
-	prefs, err := lc.GetPrefs(ctx)
-	if err != nil {
-		return
-	}
-	exit := string(prefs.ExitNodeID)
-	if prefs.AutoExitNode != "" {
-		exit = "auto:" + string(prefs.AutoExitNode)
-	}
-	s.mu.Lock()
-	s.routeAll = prefs.RouteAll
-	s.exitNode = exit
-	s.mu.Unlock()
-}
 
-func (s *statusState) snapshot() map[string]any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return map[string]any{
-		"ready":         s.ready,
-		"backend_state": s.state,
-		"route_all":     s.routeAll,
-		"exit_node":     s.exitNode,
-		"suffixes":      s.suffixes,
-		"proxies":       s.proxies,
+	out := map[string]any{
+		"ready":         false,
+		"backend_state": "",
+		"auth_url":      "",
+		"route_all":     false,
+		"exit_node":     "",
+		"suffixes":      suffixes,
+		"proxies":       proxies,
 		"version":       version,
 	}
+	if lc == nil {
+		return out
+	}
+	st, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return out
+	}
+	out["backend_state"] = st.BackendState
+	out["ready"] = st.BackendState == "Running"
+	out["auth_url"] = st.AuthURL
+	if prefs, err := lc.GetPrefs(ctx); err == nil {
+		exit := string(prefs.ExitNodeID)
+		if prefs.AutoExitNode != "" {
+			exit = "auto:" + string(prefs.AutoExitNode)
+		}
+		out["route_all"] = prefs.RouteAll
+		out["exit_node"] = exit
+	}
+	return out
 }
 
 func statusHandler(s *statusState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		snap := s.snapshot()
+		snap := s.snapshot(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		if ready, _ := snap["ready"].(bool); !ready {

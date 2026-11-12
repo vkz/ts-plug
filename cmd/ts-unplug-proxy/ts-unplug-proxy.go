@@ -123,16 +123,16 @@ func main() {
 		os.Exit(1)
 	}
 	pacDomains := splitCommaList(*flagPACDomains)
-	if *flagPACAddr != "" && len(pacDomains) == 0 {
+	if len(pacDomains) == 0 {
 		if sf, err := loadStateFile(*flagDir); err == nil {
 			if n := sf.magicDNSName(); n != "" {
 				pacDomains = []string{n}
 			}
 		}
-		if len(pacDomains) == 0 {
-			slog.Error("-pac-addr requires -pac-domain (could not derive a MagicDNS suffix from -dir)")
-			os.Exit(1)
-		}
+	}
+	if *flagPACAddr != "" && len(pacDomains) == 0 {
+		slog.Error("-pac-addr requires -pac-domain (could not derive a MagicDNS suffix from -dir)")
+		os.Exit(1)
 	}
 	verboseProxy := *flagVerboseProxy || *flagVerboseTSNet
 	if verboseProxy {
@@ -161,11 +161,34 @@ func main() {
 	}
 	defer closeAll()
 
-	// Bind listeners and serve the PAC before tsnet starts. The PAC is static,
+	ts := &tsnet.Server{
+		Hostname: tsnetHostname,
+		Dir:      *flagDir,
+	}
+	if *flagVerboseTSNet {
+		ts.Logf = func(format string, args ...any) {
+			slog.Debug(fmt.Sprintf(format, args...))
+		}
+	}
+	if *flagDisableInterfaceBinding {
+		// tsnet's network namespace can bind outbound connections to the
+		// macOS default interface. Disable it when another tunnel controls
+		// the system's interface and route selection.
+		netns.SetEnabled(false)
+	}
+	// Start the backend without waiting for a connection, so /status can report
+	// progress (including the auth URL) while tsnet connects.
+	lc, err := ts.LocalClient()
+	if err != nil {
+		slog.Error("failed to start tsnet backend", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	// Bind listeners and serve the PAC before tsnet connects. The PAC is static,
 	// so it is available immediately; tailnet requests then queue (fail closed)
 	// while the node comes up instead of the browser falling back to DIRECT
 	// because it could not fetch the PAC.
-	status := &statusState{suffixes: pacDomains, proxies: pacProxies(*flagSOCKS5Addr, *flagHTTPAddr)}
+	status := &statusState{lc: lc, suffixes: pacDomains, proxies: pacProxies(*flagSOCKS5Addr, *flagHTTPAddr)}
 	if *flagPACAddr != "" {
 		listener, err := net.Listen("tcp", *flagPACAddr)
 		if err != nil {
@@ -212,22 +235,6 @@ func main() {
 		}
 	}
 
-	ts := &tsnet.Server{
-		Hostname: tsnetHostname,
-		Dir:      *flagDir,
-	}
-	if *flagVerboseTSNet {
-		ts.Logf = func(format string, args ...any) {
-			slog.Debug(fmt.Sprintf(format, args...))
-		}
-	}
-	if *flagDisableInterfaceBinding {
-		// tsnet's network namespace can bind outbound connections to the
-		// macOS default interface. Disable it when another tunnel controls
-		// the system's interface and route selection.
-		netns.SetEnabled(false)
-	}
-
 	upStatus, err := ts.Up(ctx)
 	if err != nil {
 		slog.Error("error starting tsnet server", slog.Any("error", err))
@@ -241,11 +248,6 @@ func main() {
 
 	slog.Info("tsnet server started", slog.String("status", upStatus.BackendState))
 
-	lc, err := ts.LocalClient()
-	if err != nil {
-		slog.Error("failed to get tsnet local client", slog.Any("error", err))
-		os.Exit(1)
-	}
 	if *flagAcceptRoutes {
 		if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
 			Prefs:       ipn.Prefs{RouteAll: true},
@@ -262,6 +264,11 @@ func main() {
 		}
 	}
 	dialer := (&tailnetDialer{ts: ts, lc: lc, direct: *flagDirect, suffixes: pacDomains}).Dial
+
+	// Wait briefly for the network map so the first proxied dial does not fail
+	// while tsnet is still applying it. The listeners are already bound and the
+	// PAC is served; early connections queue in the backlog.
+	waitForNetmap(ctx, lc, 10*time.Second)
 
 	// tsnet is up; start serving the already-bound proxy listeners.
 	if socksListener != nil {
@@ -280,8 +287,6 @@ func main() {
 		startHTTPProxy(ln, dialer, serveErr)
 		slog.Info("HTTP proxy listening", slog.String("local", ln.Addr().String()))
 	}
-	status.setReady(ctx, upStatus.BackendState, lc)
-
 	select {
 	case <-ctx.Done():
 	case result := <-serveErr:
@@ -733,7 +738,7 @@ func checkLoopbackListeners() error {
 }
 
 // clearExitNode clears a persisted exit-node preference from the state dir.
-// The state file has no cross-process lock, so the proxy must be stopped.
+// The caller must hold the state-dir lock (i.e. the proxy is stopped).
 func clearExitNode(dir string) error {
 	sf, err := loadStateFile(dir)
 	if err != nil {

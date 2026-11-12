@@ -19,9 +19,9 @@ import (
 var tailnetV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 
 // doctor inspects the on-disk state and configuration and reports problems. It
-// exits non-zero if it finds any FAIL. It is deliberately offline-first: the
-// state file has no cross-process lock, so it only opens tsnet for the route
-// check when no proxy listener is active.
+// exits non-zero if it finds any FAIL. It is deliberately offline-first: it
+// only opens tsnet for the route check when it can take the state-dir lock
+// (i.e. no proxy is running).
 type doctor struct {
 	dir              string
 	socksAddr        string
@@ -234,7 +234,7 @@ func (d *doctor) checkRoutes() {
 			d.warn("no local client: %v", err)
 			return
 		}
-		status := d.waitForNetmap(ctx, lc)
+		status := waitForNetmap(ctx, lc, 15*time.Second)
 		if status == nil {
 			d.warn("status unavailable; route check skipped")
 			return
@@ -305,10 +305,10 @@ func (d *doctor) restorePrefs(key string, raw []byte, ok bool) {
 }
 
 // waitForNetmap polls until the network map has been applied (self is in it),
-// so peer routes are populated. Reading Status immediately after Up races the
-// netmap and can report no routes. Bounded to 15s.
-func (d *doctor) waitForNetmap(ctx context.Context, lc *local.Client) *ipnstate.Status {
-	deadline := time.Now().Add(15 * time.Second)
+// so peers and routes are populated. Reading Status immediately after Up races
+// the netmap. Bounded by timeout.
+func waitForNetmap(ctx context.Context, lc *local.Client, timeout time.Duration) *ipnstate.Status {
+	deadline := time.Now().Add(timeout)
 	var last *ipnstate.Status
 	for {
 		st, err := lc.Status(ctx)
