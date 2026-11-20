@@ -99,6 +99,16 @@ ts-plug:
   ts-plug -dir /var/lib/tsplug -hostname api -- ./server
   ```
 
+- `-advertise-tags` - Comma-separated Tailscale ACL tags to advertise on this node (e.g. `tag:dev,tag:web`). Needed when your tailnet ACL policy controls access using tag-based identities rather than personal user identities. Each entry must have the form `tag:<name>` with no whitespace; invalid tags fail fast before launching the child command.
+  ```sh
+  ts-plug -hostname api -advertise-tags tag:dev,tag:web -- ./server
+  ```
+
+- `-disable-interface-binding` - On macOS, disable Tailscale's network namespace integration, including physical-interface binding. Needed when another tunnel such as Cloudflare WARP / Cloudflare One controls the system's interface and route selection and would otherwise prevent `tsnet` from reaching the tailnet.
+  ```sh
+  ts-plug -disable-interface-binding -hostname myapp -- python -m http.server 8080
+  ```
+
 ### Listeners
 
 By default, ts-plug enables HTTPS on port 443 proxying to localhost:8080.

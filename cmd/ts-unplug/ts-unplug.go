@@ -11,15 +11,20 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
+	"unicode"
 
+	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
 )
 
 var (
-	flagDir        = flag.String("dir", "", "tsnet server directory")
-	flagHostname   = flag.String("hostname", "tsunplug", "hostname for the tsnet server")
-	flagDebugTSNet = flag.Bool("debug-tsnet", false, "enable tsnet.Server logging")
-	flagPort       = flag.Int("port", 80, "local port to listen on")
+	flagDir                     = flag.String("dir", "", "tsnet server directory")
+	flagHostname                = flag.String("hostname", "tsunplug", "hostname for the tsnet server")
+	flagAdvertiseTags           = flag.String("advertise-tags", "", "comma-separated Tailscale ACL tags to advertise (e.g. tag:dev,tag:proxy)")
+	flagDisableInterfaceBinding = flag.Bool("disable-interface-binding", false, "disable Tailscale's macOS network namespace integration (needed behind Cloudflare WARP/One)")
+	flagDebugTSNet              = flag.Bool("debug-tsnet", false, "enable tsnet.Server logging")
+	flagPort                    = flag.Int("port", 80, "local port to listen on")
 )
 
 func main() {
@@ -36,6 +41,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	advertiseTags, err := parseAdvertiseTags(*flagAdvertiseTags)
+	if err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+
 	remoteAddr := args[0]
 
 	// Ensure remoteAddr has a port, default to 80 if not specified
@@ -47,8 +58,9 @@ func main() {
 	defer cancelCtx()
 
 	ts := &tsnet.Server{
-		Hostname: *flagHostname,
-		Dir:      *flagDir,
+		Hostname:      *flagHostname,
+		Dir:           *flagDir,
+		AdvertiseTags: advertiseTags,
 	}
 
 	if *flagDebugTSNet {
@@ -57,6 +69,13 @@ func main() {
 			slog.Debug(fmt.Sprintf(format, args...))
 			slog.SetLogLoggerLevel(cur)
 		}
+	}
+
+	if *flagDisableInterfaceBinding {
+		// tsnet's network namespace can bind outbound connections to the
+		// macOS default interface. Disable it when another tunnel (e.g.
+		// Cloudflare WARP/One) controls interface and route selection.
+		netns.SetEnabled(false)
 	}
 
 	st, err := ts.Up(ctx)
@@ -94,4 +113,22 @@ func main() {
 	if err := http.Serve(listener, proxy); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// parseAdvertiseTags parses and validates a comma-separated list of Tailscale
+// ACL tags. Each non-empty entry must start with "tag:" followed by a name
+// containing no whitespace.
+func parseAdvertiseTags(s string) ([]string, error) {
+	var tags []string
+	for _, p := range strings.Split(s, ",") {
+		tag := strings.TrimSpace(p)
+		if tag == "" {
+			continue
+		}
+		if !strings.HasPrefix(tag, "tag:") || len(tag) == len("tag:") || strings.IndexFunc(tag, unicode.IsSpace) >= 0 {
+			return nil, fmt.Errorf("invalid -advertise-tags entry %q: tags must have form tag:<name>", tag)
+		}
+		tags = append(tags, tag)
+	}
+	return tags, nil
 }

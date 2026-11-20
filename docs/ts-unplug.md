@@ -74,6 +74,16 @@ ts-unplug -dir ./state -port 8080 api-staging.tailnet.ts.net
   ts-unplug -dir ./state -hostname myproxy -port 3000 remote.tailnet.ts.net
   ```
 
+- `-advertise-tags` - Comma-separated Tailscale ACL tags to advertise on this node (e.g. `tag:dev,tag:proxy`). Needed when your tailnet ACL policy grants access to tag-based sources rather than personal user identities. Each entry must have the form `tag:<name>` with no whitespace; invalid tags fail fast before starting `tsnet`.
+  ```sh
+  ts-unplug -dir ./state -advertise-tags tag:dev,tag:proxy -port 8080 remote.tailnet.ts.net
+  ```
+
+- `-disable-interface-binding` - On macOS, disable Tailscale's network namespace integration, including physical-interface binding. Needed when another tunnel such as Cloudflare WARP / Cloudflare One controls the system's interface and route selection and would otherwise prevent `tsnet` from connecting.
+  ```sh
+  ts-unplug -dir ./state -disable-interface-binding -port 8080 remote.tailnet.ts.net
+  ```
+
 - `-debug-tsnet` - Enable verbose tsnet.Server logging
   ```sh
   ts-unplug -dir ./state -port 8080 -debug-tsnet remote.tailnet.ts.net
