@@ -68,6 +68,12 @@ ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:1080
 
 ### Optional
 
+- `-hostname <name>` - Tailnet hostname for the `tsnet.Server` node (default: `tsunplug-proxy`). Useful when running `ts-unplug-proxy` on multiple machines.
+
+- `-advertise-tags <tag:a,tag:b>` - Comma-separated Tailscale ACL tags to advertise on this node (for example `tag:laptop-proxy`). Required if your tailnet ACLs or Tailscale SSH rules grant access to tag-based sources rather than personal user identities.
+
+- `-dial-timeout <duration>` - Timeout for dialing destinations through `tsnet` (default: `30s`). Applies to both SOCKS5 and HTTP CONNECT dials.
+
 - `-v` - Log proxy connections and proxy dials
   ```sh
   ts-unplug-proxy -dir ./state -v -socks5 127.0.0.1:1080
@@ -114,8 +120,9 @@ The PAC is served as soon as the process binds its listeners, before tsnet has
 connected, so a browser never falls back to `DIRECT` because the PAC was
 momentarily unavailable. While tsnet connects, tailnet requests queue rather
 than leaking. `GET /status` on the same address returns a JSON health document
-(`ready`, `backend_state`, `route_all`, `exit_node`, `suffixes`, `proxies`,
-`version`).
+(`ready`, `serving`, `hostname`, `backend_state`, `auth_url`, `route_all`,
+`exit_node`, `suffixes`, `proxies`, `version`) and returns HTTP `200` only when
+the backend is `Running` and the proxy listeners are accepting connections.
 
 The PAC fails closed: any host under a configured suffix or `.ts.net`, and any
 literal address in `100.64.0.0/10` (Tailscale node IPs and Service VIPs), is
@@ -148,7 +155,10 @@ ts-unplug-proxy -dir ./state -clear-exit-node
 
 `doctor` inspects the state dir, listeners, PAC and routes, and exits non-zero
 on problems. It reads prefs offline and only opens tsnet for the route check
-when it can take the state-dir lock (i.e. the proxy is not running).
+when it can take the state-dir lock (i.e. the proxy is not running). During the
+online route probe it reuses the persisted `Hostname` and `AdvertiseTags` from
+`-dir` unless overridden with `-hostname` / `-advertise-tags`, and restores the
+state file afterwards.
 
 ```sh
 ts-unplug-proxy doctor -dir ./state \
@@ -162,6 +172,133 @@ It reports:
 - the exact PAC decisions for sample hosts (tailnet, CGNAT, and public),
 - advertised routes, and accepted routes with a warning when `RouteAll` pulls
   in non-tailnet (corporate) CIDRs.
+
+## SSH over ts-unplug-proxy
+
+`ts-unplug-proxy` relays arbitrary TCP connections (both SOCKS5 `CONNECT` and
+HTTP `CONNECT` support full-duplex half-close with no idle timeout), so SSH,
+`scp`, `sftp`, `rsync -e ssh`, `git` over SSH, port forwards (`-L`/`-R`), agent
+forwarding, Emacs TRAMP, and VS Code Remote-SSH all work without installing
+`tailscaled`.
+
+Because SSH ignores system proxy settings and PAC files, configure OpenSSH's
+`ProxyCommand` for your tailnet hosts.
+
+### Recommended setup (`ts-unplug-proxy connect -fdpass`)
+
+The built-in `connect` subcommand dials the local proxy using remote hostname
+resolution (SOCKS5h / HTTP CONNECT), supports OpenSSH `ProxyUseFdpass yes`
+(passing the connected TCP socket FD directly to `ssh` via `SCM_RIGHTS` and
+exiting immediately so no helper process lingers), works identically on macOS
+and Linux with no extra tools installed, and prints actionable errors to stderr.
+
+In `~/.ssh/config` (or an included file such as `~/.ssh/config.d/tsnet-proxy.conf`):
+
+```sshconfig
+Match final host *.wild-dojo.ts.net,*.ts.net
+  ProxyCommand ts-unplug-proxy connect -fdpass -status 127.0.0.1:8099 %h %p
+  ProxyUseFdpass yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+```
+
+If GUI apps (such as VS Code Remote-SSH on macOS) launch `ssh` without your
+shell's `PATH`, use `~` (or `$HOME` or an absolute path) — `ProxyCommand` runs
+through your shell, so `~` expands reliably (note: OpenSSH does **not** support
+the `%d` token inside `ProxyCommand`):
+
+```sshconfig
+  ProxyCommand ~/.local/share/mise/shims/ts-unplug-proxy connect -fdpass -status 127.0.0.1:8099 %h %p
+```
+
+Key flags for `ts-unplug-proxy connect`:
+- `-socks5 <addr>` — SOCKS5 proxy address (default `127.0.0.1:1080` when `-http` is unset)
+- `-http <addr>` — HTTP CONNECT proxy address (mutually exclusive with `-socks5`; surfaces `Tailscale-Connect-Error` on failure)
+- `-fdpass` — pass the connected socket FD to `ssh` (`ProxyUseFdpass yes`) and exit; omit `-fdpass` (and `ProxyUseFdpass`) for standard stdio relay
+- `-status <addr>` — optional `/status` listener (e.g. `127.0.0.1:8099`) so `ssh` fails fast with the Tailscale login URL when the proxy is in `NeedsLogin` instead of waiting for `-timeout`
+- `-timeout <dur>` — connect and handshake timeout (default `35s`, slightly above the proxy's `30s` `-dial-timeout` so proxy-side errors surface before the client times out; raise this above `-dial-timeout` if you increase it)
+
+### Why `Match final host` instead of `Host`
+
+If your `~/.ssh/config` defines short aliases like:
+
+```sshconfig
+Host gxa
+  HostName gxa.wild-dojo.ts.net
+```
+
+a `Host *.wild-dojo.ts.net` block will **not** match `ssh gxa` because `Host`
+only matches the alias typed on the command line, not the expanded `HostName`.
+`Match final host *.wild-dojo.ts.net,*.ts.net` triggers OpenSSH's final pass
+after `HostName` substitution, so:
+- both `ssh gxa` and `ssh gxa.wild-dojo.ts.net` match, even when the `Match`
+  block is included near the top of `~/.ssh/config`;
+- hosts that already set `ProxyJump` on pass 1 keep their `ProxyJump`;
+- non-tailnet hosts (`github.com`, LAN IPs) are unaffected.
+
+### Watch out for raw `100.x` IP addresses
+
+Do **not** glob `100.*` in `Match final host` on machines running Cloudflare
+WARP/One (which also allocates addresses inside `100.64.0.0/10`), and note that
+OpenSSH `Match host` does not evaluate CIDR notation like `100.64.0.0/10`.
+Prefer MagicDNS hostnames (`host.tailnet.ts.net`), or match specific literal
+Tailscale IPs explicitly when a host has no MagicDNS name.
+
+### Fallback using `/usr/bin/nc` (macOS)
+
+If you prefer not to invoke `ts-unplug-proxy connect`, macOS's built-in
+`/usr/bin/nc` supports SOCKS5 hostname mode (`-X 5 -x`, without `-F` FD passing):
+
+```sshconfig
+Match final host *.wild-dojo.ts.net,*.ts.net
+  ProxyCommand /usr/bin/nc -X 5 -x 127.0.0.1:1080 %h %p
+  ServerAliveInterval 30
+```
+
+One-shot form:
+```sh
+ssh -o ProxyCommand='/usr/bin/nc -X 5 -x 127.0.0.1:1080 %h %p' user@machine.tailnet.ts.net
+```
+
+Note: Linux distributions vary widely in `nc` implementations (GNU `netcat`
+does not support `-X 5 -x`), which is why `ts-unplug-proxy connect` is the
+portable default.
+
+### Connection multiplexing (`ControlMaster`)
+
+Opening each new SSH session over `tsnet` performs a full SSH handshake over
+the userspace tunnel. For repeated `ssh`/`scp`/`git`/`rsync` commands, scoping
+OpenSSH multiplexing to your tailnet block eliminates that per-command setup
+cost:
+
+```sshconfig
+Match final host *.wild-dojo.ts.net,*.ts.net
+  ProxyCommand ts-unplug-proxy connect -fdpass -status 127.0.0.1:8099 %h %p
+  ProxyUseFdpass yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 5m
+```
+
+Tradeoff: an idle master connection can linger briefly after a proxy restart
+until keepalives expire (or until you run `ssh -O exit <host>`). Keep
+`ControlPersist` short (or omit it if you prefer fresh dials on every command).
+
+### Tailscale SSH (`tailssh`)
+
+Targets running Tailscale SSH (instead of `sshd`) work transparently through
+`ts-unplug-proxy`, including check mode (the target node pushes the verification
+URL as an SSH auth banner directly to your terminal). Two caveats apply:
+
+1. **Identity and ACLs:** Without `-advertise-tags`, the `tsnet` node
+   authenticates as your user identity (`autogroup:member` / user ACLs). If
+   your tailnet SSH policy requires a tagged source, pass
+   `-advertise-tags tag:<name>`.
+2. **Subnet-routed hosts:** Tailscale SSH only terminates on Tailscale nodes
+   themselves; hosts reached behind a subnet router (`-accept-routes`) still
+   need a regular `sshd`.
 
 ## Examples
 

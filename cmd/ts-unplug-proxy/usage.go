@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -16,17 +17,24 @@ WHY THIS EXISTS
   that entirely: it is a userspace WireGuard + netstack node, so tailnet
   100.x addresses never enter the kernel routing table. This proxy dials
   requested destinations through that tsnet node, so you can reach tailnet
-  hosts from a browser or CLI without installing tailscaled.
+  hosts from a browser, CLI, or SSH without installing tailscaled.
 
 USAGE
   ts-unplug-proxy -dir <state-dir> (-socks5 <addr> | -http <addr>) [-pac-addr <addr>] [options]
-  ts-unplug-proxy doctor -dir <state-dir> [-socks5 <addr>] [-http <addr>] [-pac-addr <addr>]
+  ts-unplug-proxy connect [-socks5 <addr> | -http <addr>] [-fdpass] [-status <addr>] <host> <port>
+  ts-unplug-proxy doctor -dir <state-dir> [-socks5 <addr>] [-http <addr>] [-pac-addr <addr>] [-hostname <name>] [-advertise-tags <tags>]
   ts-unplug-proxy -dir <state-dir> -clear-exit-node
   ts-unplug-proxy -version
 
-  At least one of -socks5 or -http is required to serve; a PAC alone has
-  nothing to route to. Proxy clients choose the destination; this command does
-  not take a remote address argument.
+  Subcommands ('connect', 'doctor') must be the first argument. At least one of
+  -socks5 or -http is required to serve; a PAC alone has nothing to route to.
+  Proxy clients choose the destination; serve mode does not take a remote
+  address argument.
+
+  'connect' is a lightweight client helper for OpenSSH ProxyCommand (run
+  'ts-unplug-proxy connect -h' for its flags). With -fdpass and OpenSSH
+  "ProxyUseFdpass yes", it completes the proxy handshake, hands the connected
+  TCP socket FD directly to ssh, and exits immediately.
 
 LISTENERS
   -socks5 <addr>   SOCKS5 proxy. Clients must send the hostname (curl
@@ -44,6 +52,12 @@ LISTENERS
 ROUTING AND RESOLUTION
   -dir <path>                    tsnet state directory (required). Holds the
                                  node identity; keep it 0700.
+  -hostname <name>               Tailnet hostname for the tsnet node (default
+                                 "tsunplug-proxy").
+  -advertise-tags <tag:a,...>    Comma-separated Tailscale ACL tags to advertise
+                                 on this node (needed for tag-gated SSH ACLs).
+  -dial-timeout <dur>            Timeout for dialing destinations through tsnet
+                                 (default 30s; applies to both SOCKS5 and HTTP).
   -pac-domain <a,b>              Comma-separated tailnet DNS suffixes the PAC
                                  must never send DIRECT. Defaults to the
                                  MagicDNS name recorded in -dir.
@@ -111,13 +125,19 @@ EXAMPLES
     -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net \
     -disable-interface-binding -accept-routes
 
+  # OpenSSH (~/.ssh/config) using FD passing (zero lingering helper process)
+  Match final host *.wild-dojo.ts.net,*.ts.net
+    ProxyCommand ts-unplug-proxy connect -fdpass -status 127.0.0.1:8099 %h %p
+    ProxyUseFdpass yes
+    ServerAliveInterval 30
+
   # Diagnose the state dir, listeners, PAC and routes
   ts-unplug-proxy doctor -dir ~/.local/state/ts-unplug-proxy \
     -http 127.0.0.1:8080 -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net
 `
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, usageText)
+	_, _ = io.WriteString(os.Stderr, usageText)
 	fmt.Fprintln(os.Stderr, "\nOPTIONS")
 	fmt.Fprintln(os.Stderr)
 	flagDefaults()

@@ -50,6 +50,12 @@ ts-unplug-proxy -dir ~/.local/state/ts-unplug-proxy \
   -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net \
   -disable-interface-binding -accept-routes
 
+# OpenSSH (~/.ssh/config) — zero lingering helper process via ProxyUseFdpass
+Match final host *.wild-dojo.ts.net,*.ts.net
+  ProxyCommand ts-unplug-proxy connect -fdpass -status 127.0.0.1:8099 %h %p
+  ProxyUseFdpass yes
+  ServerAliveInterval 30
+
 # diagnose state, listeners, PAC and routes
 ts-unplug-proxy doctor -dir ~/.local/state/ts-unplug-proxy -http 127.0.0.1:8080
 ```

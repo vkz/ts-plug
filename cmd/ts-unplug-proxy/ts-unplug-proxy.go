@@ -28,10 +28,16 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const tsnetHostname = "tsunplug-proxy"
+const (
+	tsnetHostname      = "tsunplug-proxy"
+	defaultDialTimeout = 30 * time.Second
+)
 
 var (
 	flagDir                     = flag.String("dir", "", "tsnet server directory")
+	flagHostname                = flag.String("hostname", tsnetHostname, "tailnet hostname for the tsnet node")
+	flagAdvertiseTags           = flag.String("advertise-tags", "", "comma-separated Tailscale ACL tags to advertise (e.g. tag:proxy)")
+	flagDialTimeout             = flag.Duration("dial-timeout", defaultDialTimeout, "timeout for dialing destinations through tsnet")
 	flagVerboseProxy            = flag.Bool("v", false, "log proxy connections")
 	flagVerboseTSNet            = flag.Bool("vv", false, "log proxy connections and tsnet debug info")
 	flagSOCKS5Addr              = flag.String("socks5", "", "SOCKS5 proxy listen address")
@@ -53,10 +59,11 @@ type serveResult struct {
 }
 
 type tailnetDialer struct {
-	ts       *tsnet.Server
-	lc       *local.Client
-	direct   bool
-	suffixes []string
+	ts          *tsnet.Server
+	lc          *local.Client
+	direct      bool
+	suffixes    []string
+	dialTimeout time.Duration
 }
 
 type loggingListener struct {
@@ -79,9 +86,14 @@ func (ln loggingListener) Accept() (net.Conn, error) {
 
 func main() {
 	doctorMode := false
-	if len(os.Args) > 1 && os.Args[1] == "doctor" {
-		doctorMode = true
-		os.Args = append(os.Args[:1], os.Args[2:]...)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "connect":
+			os.Exit(runConnect(os.Args[2:]))
+		case "doctor":
+			doctorMode = true
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+		}
 	}
 	flag.Usage = printUsage
 	flag.Parse()
@@ -96,6 +108,20 @@ func main() {
 	}
 	if flag.NArg() != 0 {
 		slog.Error("positional remote addresses are not supported; proxy clients provide destinations")
+		os.Exit(1)
+	}
+	hostname := strings.TrimSpace(*flagHostname)
+	if hostname == "" {
+		slog.Error("-hostname must not be empty")
+		os.Exit(1)
+	}
+	advertiseTags, err := parseAdvertiseTags(*flagAdvertiseTags)
+	if err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	if *flagDialTimeout <= 0 {
+		slog.Error("-dial-timeout must be positive")
 		os.Exit(1)
 	}
 	if *flagClearExitNode {
@@ -162,8 +188,9 @@ func main() {
 	defer closeAll()
 
 	ts := &tsnet.Server{
-		Hostname: tsnetHostname,
-		Dir:      *flagDir,
+		Hostname:      hostname,
+		Dir:           *flagDir,
+		AdvertiseTags: advertiseTags,
 	}
 	if *flagVerboseTSNet {
 		ts.Logf = func(format string, args ...any) {
@@ -188,7 +215,12 @@ func main() {
 	// so it is available immediately; tailnet requests then queue (fail closed)
 	// while the node comes up instead of the browser falling back to DIRECT
 	// because it could not fetch the PAC.
-	status := &statusState{lc: lc, suffixes: pacDomains, proxies: pacProxies(*flagSOCKS5Addr, *flagHTTPAddr)}
+	status := &statusState{
+		lc:       lc,
+		hostname: hostname,
+		suffixes: pacDomains,
+		proxies:  pacProxies(*flagSOCKS5Addr, *flagHTTPAddr),
+	}
 	if *flagPACAddr != "" {
 		listener, err := net.Listen("tcp", *flagPACAddr)
 		if err != nil {
@@ -263,12 +295,20 @@ func main() {
 			slog.Warn("failed to configure tailnet exit node", slog.Any("error", err))
 		}
 	}
-	dialer := (&tailnetDialer{ts: ts, lc: lc, direct: *flagDirect, suffixes: pacDomains}).Dial
+	dialer := (&tailnetDialer{
+		ts:          ts,
+		lc:          lc,
+		direct:      *flagDirect,
+		suffixes:    pacDomains,
+		dialTimeout: *flagDialTimeout,
+	}).Dial
 
 	// Wait briefly for the network map so the first proxied dial does not fail
 	// while tsnet is still applying it. The listeners are already bound and the
 	// PAC is served; early connections queue in the backlog.
-	waitForNetmap(ctx, lc, 10*time.Second)
+	if st := waitForNetmap(ctx, lc, 10*time.Second); st == nil || st.Self == nil || !st.Self.InNetworkMap {
+		slog.Warn("network map not ready after 10s; starting proxy listeners anyway")
+	}
 
 	// tsnet is up; start serving the already-bound proxy listeners.
 	if socksListener != nil {
@@ -276,7 +316,7 @@ func main() {
 		if verboseProxy {
 			ln = loggingListener{Listener: ln, proxy: "socks5"}
 		}
-		startSOCKS5Proxy(ln, dialer, serveErr)
+		startSOCKS5Proxy(ctx, ln, dialer, serveErr)
 		slog.Info("SOCKS5 proxy listening", slog.String("local", ln.Addr().String()))
 	}
 	if httpListener != nil {
@@ -284,7 +324,7 @@ func main() {
 		if verboseProxy {
 			ln = loggingListener{Listener: ln, proxy: "http"}
 		}
-		startHTTPProxy(ln, dialer, serveErr)
+		startHTTPProxy(ctx, ln, dialer, serveErr)
 		slog.Info("HTTP proxy listening", slog.String("local", ln.Addr().String()))
 	}
 	status.setServing()
@@ -325,8 +365,15 @@ func useExitNodeIfAvailable(ctx context.Context, lc *local.Client) error {
 	return nil
 }
 
+func (d *tailnetDialer) timeout() time.Duration {
+	if d.dialTimeout > 0 {
+		return d.dialTimeout
+	}
+	return defaultDialTimeout
+}
+
 func (d *tailnetDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, d.timeout())
 	defer cancel()
 
 	resolvedAddr, resolved, err := d.resolveAddr(dialCtx, network, addr)
@@ -610,25 +657,86 @@ func parseDNSIPs(response []byte, queryType string) ([]netip.Addr, error) {
 	}
 }
 
-func startSOCKS5Proxy(listener net.Listener, dialer func(context.Context, string, string) (net.Conn, error), serveErr chan<- serveResult) {
+func startSOCKS5Proxy(ctx context.Context, listener net.Listener, dialer func(context.Context, string, string) (net.Conn, error), serveErr chan<- serveResult) {
 	proxy := &socks5.Server{
 		Logf: func(format string, args ...any) {
 			slog.Debug(fmt.Sprintf(format, args...))
 		},
-		Dialer: dialer,
+		Dialer: func(_ context.Context, network, addr string) (net.Conn, error) {
+			// tailscale.com/net/socks5.Server.handleTCP hardcodes a 5s dial
+			// context derived from context.Background(), which cuts short our
+			// dialer's timeout on cold starts, laptop wake, or slow DERP/WARP
+			// handshakes. Pass the proxy's lifecycle ctx so tailnetDialer's
+			// configured timeout governs and shutdown cancels in-flight dials.
+			return dialer(ctx, network, addr)
+		},
 	}
 	go func() {
 		serveErr <- serveResult{name: "socks5", err: proxy.Serve(listener)}
 	}()
 }
 
-func startHTTPProxy(listener net.Listener, dialer func(context.Context, string, string) (net.Conn, error), serveErr chan<- serveResult) {
+func startHTTPProxy(ctx context.Context, listener net.Listener, dialer func(context.Context, string, string) (net.Conn, error), serveErr chan<- serveResult) {
 	server := &http.Server{
-		Handler: httpProxyHandler(dialer),
+		Handler:     httpProxyHandler(dialer),
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	go func() {
 		serveErr <- serveResult{name: "http", err: server.Serve(listener)}
 	}()
+}
+
+type halfCloser interface {
+	CloseWrite() error
+}
+
+type relayDstError struct{ error }
+
+func (e relayDstError) Unwrap() error { return e.error }
+
+type relayDstWriter struct{ io.Writer }
+
+func (w relayDstWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if err != nil {
+		err = relayDstError{err}
+	}
+	return n, err
+}
+
+// pumpHalfClose copies src into dst until EOF or error, propagating EOF as a
+// TCP half-close (CloseWrite) when dst supports it so the peer can finish
+// draining its response before tearing down the tunnel.
+func pumpHalfClose(dst net.Conn, src io.Reader) error {
+	if _, err := io.Copy(relayDstWriter{dst}, src); err != nil {
+		return err
+	}
+	if hc, ok := dst.(halfCloser); ok {
+		if err := hc.CloseWrite(); err != nil {
+			return relayDstError{err}
+		}
+	}
+	return nil
+}
+
+// relayConn pumps bytes in both directions with half-close support. On clean
+// EOF in one direction it waits for the reverse direction to finish draining;
+// on a read error it closes both sockets to unblock the peer goroutine.
+func relayConn(client, backend net.Conn, clientSrc io.Reader) {
+	errc := make(chan error, 2)
+	go func() { errc <- pumpHalfClose(client, backend) }()
+	go func() { errc <- pumpHalfClose(backend, clientSrc) }()
+	err := <-errc
+	if err == nil {
+		<-errc
+		return
+	}
+	var dstErr relayDstError
+	if !errors.As(err, &dstErr) {
+		_ = backend.Close()
+		_ = client.Close()
+	}
+	<-errc
 }
 
 func httpProxyHandler(dialer func(context.Context, string, string) (net.Conn, error)) http.Handler {
@@ -676,17 +784,20 @@ func httpProxyHandler(dialer func(context.Context, string, string) (net.Conn, er
 			clientSrc = client
 		}
 
-		errc := make(chan error, 2)
-		go func() {
-			_, err := io.Copy(client, backend)
-			errc <- err
-		}()
-		go func() {
-			_, err := io.Copy(backend, clientSrc)
-			errc <- err
-		}()
-		<-errc
+		relayConn(client, backend, clientSrc)
 	})
+}
+
+// parseAdvertiseTags parses and validates a comma-separated list of Tailscale
+// ACL tags. Each non-empty entry must start with "tag:" followed by a name.
+func parseAdvertiseTags(s string) ([]string, error) {
+	tags := splitCommaList(s)
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, "tag:") || len(tag) == len("tag:") || strings.ContainsAny(tag, " \t\r\n") {
+			return nil, fmt.Errorf("invalid -advertise-tags entry %q: tags must have form tag:<name>", tag)
+		}
+	}
+	return tags, nil
 }
 
 // splitCommaList splits a comma-separated flag value, dropping blanks.

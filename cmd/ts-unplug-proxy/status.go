@@ -15,6 +15,7 @@ import (
 type statusState struct {
 	mu       sync.Mutex
 	lc       *local.Client
+	hostname string
 	serving  bool
 	suffixes []string
 	proxies  []string
@@ -32,6 +33,7 @@ func (s *statusState) setServing() {
 func (s *statusState) snapshot(ctx context.Context) map[string]any {
 	s.mu.Lock()
 	lc := s.lc
+	hostname := s.hostname
 	serving := s.serving
 	suffixes := s.suffixes
 	proxies := s.proxies
@@ -40,6 +42,7 @@ func (s *statusState) snapshot(ctx context.Context) map[string]any {
 	out := map[string]any{
 		"ready":         false,
 		"serving":       serving,
+		"hostname":      hostname,
 		"backend_state": "",
 		"auth_url":      "",
 		"route_all":     false,
@@ -58,6 +61,9 @@ func (s *statusState) snapshot(ctx context.Context) map[string]any {
 	out["backend_state"] = st.BackendState
 	out["ready"] = st.BackendState == "Running"
 	out["auth_url"] = st.AuthURL
+	if st.Self != nil && st.Self.HostName != "" {
+		out["hostname"] = st.Self.HostName
+	}
 	if prefs, err := lc.GetPrefs(ctx); err == nil {
 		exit := string(prefs.ExitNodeID)
 		if prefs.AutoExitNode != "" {

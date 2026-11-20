@@ -8,7 +8,7 @@ import (
 )
 
 func TestStatusHandlerReadiness(t *testing.T) {
-	s := &statusState{suffixes: []string{"wild-dojo.ts.net"}, proxies: []string{"PROXY 127.0.0.1:8080"}}
+	s := &statusState{hostname: "my-proxy", suffixes: []string{"wild-dojo.ts.net"}, proxies: []string{"PROXY 127.0.0.1:8080"}}
 
 	// No LocalClient yet and not serving: 503.
 	rec := httptest.NewRecorder()
@@ -23,7 +23,10 @@ func TestStatusHandlerReadiness(t *testing.T) {
 	if body["ready"] != false || body["serving"] != false {
 		t.Errorf("ready/serving = %v/%v, want false/false", body["ready"], body["serving"])
 	}
-	for _, key := range []string{"backend_state", "auth_url", "route_all", "exit_node", "suffixes", "proxies", "version"} {
+	if body["hostname"] != "my-proxy" {
+		t.Errorf("hostname = %v, want my-proxy", body["hostname"])
+	}
+	for _, key := range []string{"hostname", "backend_state", "auth_url", "route_all", "exit_node", "suffixes", "proxies", "version"} {
 		if _, ok := body[key]; !ok {
 			t.Errorf("status body missing %q", key)
 		}

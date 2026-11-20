@@ -19,6 +19,8 @@ const stateFileName = "tailscaled.state"
 // names come from ipn.Prefs; AutoExitNode is an ExitNodeExpression string
 // ("any" for automatic exit-node selection) and is omitted when empty.
 type persistedPrefs struct {
+	Hostname               string   `json:"Hostname"`
+	AdvertiseTags          []string `json:"AdvertiseTags"`
 	AutoExitNode           string   `json:"AutoExitNode"`
 	ExitNodeID             string   `json:"ExitNodeID"`
 	ExitNodeIP             string   `json:"ExitNodeIP"`

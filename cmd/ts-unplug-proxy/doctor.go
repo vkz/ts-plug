@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -24,6 +25,10 @@ var tailnetV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 // (i.e. no proxy is running).
 type doctor struct {
 	dir              string
+	hostname         string
+	hostnameSet      bool
+	advertiseTags    []string
+	tagsSet          bool
 	socksAddr        string
 	httpAddr         string
 	pacAddr          string
@@ -50,8 +55,23 @@ func (d *doctor) section(name string)             { fmt.Printf("\n%s:\n", name) 
 
 // runDoctor executes all checks and returns a process exit code.
 func runDoctor() int {
+	// main() already validated -hostname and -advertise-tags before calling us.
+	tags, _ := parseAdvertiseTags(*flagAdvertiseTags)
+	var hostnameSet, tagsSet bool
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "hostname":
+			hostnameSet = true
+		case "advertise-tags":
+			tagsSet = true
+		}
+	})
 	d := &doctor{
 		dir:              *flagDir,
+		hostname:         strings.TrimSpace(*flagHostname),
+		hostnameSet:      hostnameSet,
+		advertiseTags:    tags,
+		tagsSet:          tagsSet,
 		socksAddr:        *flagSOCKS5Addr,
 		httpAddr:         *flagHTTPAddr,
 		pacAddr:          *flagPACAddr,
@@ -209,7 +229,10 @@ func (d *doctor) checkRoutes() {
 	defer lock.Close()
 	// tsnet.Up replaces the persisted prefs with defaults (Hostname, WantRunning,
 	// ControlURL, ...), so probing with a second tsnet.Server would mutate the
-	// state dir. Snapshot the prefs bytes and restore them when done.
+	// state dir and announce different Hostname/AdvertiseTags to control.
+	// Snapshot the prefs bytes, reuse persisted Hostname/AdvertiseTags when the
+	// caller did not pass them explicitly, and restore the file when done.
+	probeHostname, probeTags := d.probeIdentity()
 	snapKey, snapRaw, snapOK := d.snapshotPrefs()
 	func() {
 		if *flagDisableInterfaceBinding {
@@ -218,8 +241,9 @@ func (d *doctor) checkRoutes() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		ts := &tsnet.Server{
-			Hostname: tsnetHostname,
-			Dir:      d.dir,
+			Hostname:      probeHostname,
+			Dir:           d.dir,
+			AdvertiseTags: probeTags,
 			Logf: func(format string, args ...any) {
 				slog.Debug(fmt.Sprintf(format, args...))
 			},
@@ -274,6 +298,31 @@ func (d *doctor) checkRoutes() {
 		}
 	}()
 	d.restorePrefs(snapKey, snapRaw, snapOK)
+}
+
+// probeIdentity resolves the Hostname and AdvertiseTags to use for doctor's
+// online probe, preserving persisted values from -dir unless explicitly
+// overridden via CLI flags so probing does not rename or untag the node on the
+// Tailscale control server.
+func (d *doctor) probeIdentity() (string, []string) {
+	hostname := d.hostname
+	tags := d.advertiseTags
+	if (!d.hostnameSet || !d.tagsSet) && d.dir != "" {
+		if sf, err := loadStateFile(d.dir); err == nil {
+			if p, err := sf.prefs(); err == nil {
+				if !d.hostnameSet && p.Hostname != "" {
+					hostname = p.Hostname
+				}
+				if !d.tagsSet && len(p.AdvertiseTags) > 0 {
+					tags = append([]string(nil), p.AdvertiseTags...)
+				}
+			}
+		}
+	}
+	if hostname == "" {
+		hostname = tsnetHostname
+	}
+	return hostname, tags
 }
 
 func (d *doctor) snapshotPrefs() (key string, raw []byte, ok bool) {
