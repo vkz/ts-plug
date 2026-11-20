@@ -145,7 +145,11 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 		}
 	}
-	flag.Usage = printUsage
+	if doctorMode {
+		flag.Usage = printDoctorUsage
+	} else {
+		flag.Usage = printUsage
+	}
 	flag.Parse()
 
 	if *flagVersion {
@@ -998,7 +1002,8 @@ func httpProxyHandler(dialer func(context.Context, string, string) (net.Conn, er
 	proxy := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {},
 		Transport: &http.Transport{
-			DialContext: dialer,
+			DialContext:     dialer,
+			IdleConnTimeout: 90 * time.Second,
 		},
 	}
 

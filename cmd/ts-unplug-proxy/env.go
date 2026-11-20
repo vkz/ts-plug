@@ -54,6 +54,8 @@ AUTO-DISCOVERY
 ENVIRONMENT VARIABLES SET
   When SOCKS5 is configured:
     ALL_PROXY, all_proxy = socks5h://<socks5>
+    (when HTTP is not configured, unsets inherited HTTP_PROXY/http_proxy/
+    HTTPS_PROXY/https_proxy so they cannot override ALL_PROXY)
   When HTTP is configured:
     HTTP_PROXY, http_proxy, HTTPS_PROXY, https_proxy = http://<http>
     (and ALL_PROXY, all_proxy = http://<http> when SOCKS5 is not configured)
@@ -133,16 +135,17 @@ func runEnvIO(args []string, environ []string, stdout, stderr io.Writer, execFn 
 	}
 
 	proxyEnv := buildProxyEnv(socksAddr, httpAddr, *noProxyFlag, environ)
+	unsets := staleProxyEnvUnsets(httpAddr)
 
 	if *printFlag {
-		writeShellExports(stdout, proxyEnv)
+		writeShellExports(stdout, proxyEnv, unsets)
 		return 0
 	}
 
 	if execFn == nil {
 		execFn = execCommand
 	}
-	merged := mergeEnv(environ, proxyEnv)
+	merged := mergeEnvWithUnsets(environ, proxyEnv, unsets)
 	code, err := execFn(cmdArgs, merged)
 	if err != nil {
 		fmt.Fprintf(stderr, "ts-unplug-proxy env: %v\n", err)
@@ -254,16 +257,41 @@ func mergeNoProxy(environ []string, extraNoProxy string) string {
 	return strings.Join(merged, ",")
 }
 
+// staleProxyEnvUnsets returns inherited proxy variables that must be cleared
+// so they do not override the configured proxy scheme. In SOCKS5-only mode
+// (httpAddr == ""), curl and HTTP libraries prefer inherited HTTP(S)_PROXY over
+// ALL_PROXY unless those variables are unset.
+func staleProxyEnvUnsets(httpAddr string) []string {
+	if httpAddr != "" {
+		return nil
+	}
+	return []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"}
+}
+
 // mergeEnv returns a new environment slice with overrides applied over base.
 // Matching keys (case-sensitive) are replaced without duplicates, unrelated
 // entries are preserved in order, and new keys are appended in sorted order.
 func mergeEnv(base []string, overrides map[string]string) []string {
+	return mergeEnvWithUnsets(base, overrides, nil)
+}
+
+func mergeEnvWithUnsets(base []string, overrides map[string]string, unsets []string) []string {
+	unsetSet := make(map[string]bool, len(unsets))
+	for _, k := range unsets {
+		if _, overridden := overrides[k]; !overridden {
+			unsetSet[k] = true
+		}
+	}
+
 	out := make([]string, 0, len(base)+len(overrides))
 	seen := make(map[string]bool, len(overrides))
 
 	for _, entry := range base {
 		k, _, ok := strings.Cut(entry, "=")
 		if ok {
+			if unsetSet[k] {
+				continue
+			}
 			if val, exists := overrides[k]; exists {
 				if !seen[k] {
 					out = append(out, k+"="+val)
@@ -288,7 +316,10 @@ func mergeEnv(base []string, overrides map[string]string) []string {
 	return out
 }
 
-func writeShellExports(w io.Writer, env map[string]string) {
+func writeShellExports(w io.Writer, env map[string]string, unsets []string) {
+	if len(unsets) > 0 {
+		fmt.Fprintf(w, "unset %s\n", strings.Join(unsets, " "))
+	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)

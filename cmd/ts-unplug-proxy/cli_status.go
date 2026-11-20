@@ -318,7 +318,7 @@ func formatRelativeDuration(d time.Duration) string {
 }
 
 type peerSummary struct {
-	Self           bool     `json:"self,omitempty"`
+	Self           bool     `json:"self"`
 	Hostname       string   `json:"hostname"`
 	DNSName        string   `json:"dns_name"`
 	IPs            []string `json:"ips"`

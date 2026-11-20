@@ -56,7 +56,7 @@ curl -x http://localhost:8080 http://api.tailnet-name.ts.net
 - Local SOCKS5, HTTP CONNECT, and dynamic fail-closed PAC proxies into the tailnet
 - Static local TCP port forwards (`-L local=remote`) and `-tailnet-only` destination guard
 - Built-in OpenSSH `ProxyCommand` helper with `ProxyUseFdpass` (`connect -fdpass`)
-- Tailnet CLI over a `0600` Unix control socket (`status`, `peers`, `ping`, `login`, `conns`, `env`, `file`/`cp` Taildrop, `doctor`)
+- Tailnet CLI over a `0600` Unix control socket (`status`, `peers`, `ping`, `login`, `conns`, `env`, `file`/`cp` Taildrop), plus offline/online `doctor` diagnostics
 - Coexistence with macOS tunnels like Cloudflare WARP (`-disable-interface-binding`)
 
 ## Examples

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,12 +172,15 @@ func TestControlServerStatusConnsAndLocalAPIProxy(t *testing.T) {
 
 	// Mock tsnet LocalAPI server listening on an internal TCP socket, reached
 	// through a custom localDial function (just like tsnet's lc.Dial).
+	var headerMu sync.Mutex
 	var gotHost, gotOrigin, gotReferer string
 	mockLocalMux := http.NewServeMux()
 	mockLocalMux.HandleFunc("/localapi/v0/status", func(w http.ResponseWriter, r *http.Request) {
+		headerMu.Lock()
 		gotHost = r.Host
 		gotOrigin = r.Header.Get("Origin")
 		gotReferer = r.Header.Get("Referer")
+		headerMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(&ipnstate.Status{
 			BackendState: "Running",
@@ -283,8 +287,11 @@ func TestControlServerStatusConnsAndLocalAPIProxy(t *testing.T) {
 	if st.BackendState != "Running" || st.Self == nil || st.Self.HostName != "mock-node" {
 		t.Errorf("proxied localapi status = %+v", st)
 	}
-	if gotHost != "local-tailscaled.sock" {
-		t.Errorf("upstream Host = %q, want local-tailscaled.sock", gotHost)
+	headerMu.Lock()
+	upstreamHost := gotHost
+	headerMu.Unlock()
+	if upstreamHost != "local-tailscaled.sock" {
+		t.Errorf("upstream Host = %q, want local-tailscaled.sock", upstreamHost)
 	}
 
 	// 4. Verify Origin and Referer are stripped by the reverse proxy Director.
@@ -300,8 +307,14 @@ func TestControlServerStatusConnsAndLocalAPIProxy(t *testing.T) {
 	}
 	_, _ = io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
-	if gotOrigin != "" || gotReferer != "" {
-		t.Errorf("Origin/Referer not stripped: Origin=%q Referer=%q", gotOrigin, gotReferer)
+	headerMu.Lock()
+	origin, referer, host := gotOrigin, gotReferer, gotHost
+	headerMu.Unlock()
+	if host != "local-tailscaled.sock" {
+		t.Errorf("Host = %q, want local-tailscaled.sock", host)
+	}
+	if origin != "" || referer != "" {
+		t.Errorf("Origin/Referer not stripped: Origin=%q Referer=%q", origin, referer)
 	}
 
 	// 5. Verify FlushInterval: -1 streams chunks immediately before EOF.
@@ -323,5 +336,13 @@ func TestControlServerStatusConnsAndLocalAPIProxy(t *testing.T) {
 	}
 	if strings.TrimSpace(line) != "chunk-1" {
 		t.Errorf("streamed chunk = %q, want chunk-1", line)
+	}
+
+	// 6. Verify listenControlSocket refuses to stomp a live listening socket.
+	if ln2, err := listenControlSocket(sockPath); err == nil {
+		ln2.Close()
+		t.Fatalf("listenControlSocket(%q) unexpectedly succeeded over a live listener", sockPath)
+	} else if !strings.Contains(err.Error(), "already in use") {
+		t.Errorf("live socket error = %v, want 'already in use'", err)
 	}
 }

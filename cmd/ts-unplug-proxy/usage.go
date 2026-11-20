@@ -167,12 +167,42 @@ EXAMPLES
     -http 127.0.0.1:8080 -pac-addr 127.0.0.1:8099
 `
 
+const doctorUsageText = `ts-unplug-proxy doctor - diagnose state dir, persisted prefs, listeners, PAC, and routes.
+
+USAGE
+  ts-unplug-proxy doctor -dir <state-dir> [options]
+
+OPTIONS
+  -dir <path>                 tsnet state directory (required)
+  -socks5 <addr>              SOCKS5 listener address to validate
+  -http <addr>                HTTP proxy listener address to validate
+  -L <local=remote>           static TCP forward to validate (repeatable)
+  -pac-addr <addr>            PAC listener address to validate
+  -pac-domain <a,b>           tailnet DNS suffixes to check in PAC decisions
+  -hostname <name>            override persisted hostname for online route probe
+  -advertise-tags <tag:a,...> override persisted tags for online route probe
+  -accept-routes              report advertised/accepted peer routes
+  -disable-interface-binding  disable macOS network namespace binding during probe
+  -allow-non-loopback         allow non-loopback listeners (warns instead of failing)
+
+Checks state prefs offline and only opens tsnet for the route check when no
+running daemon holds the state-dir lock (preserving persisted Hostname and
+AdvertiseTags unless overridden, and restoring the state file afterwards).
+`
+
+func printDoctorUsage() {
+	_, _ = io.WriteString(os.Stderr, doctorUsageText)
+}
+
 func runHelp(args []string) int {
 	if len(args) == 0 {
 		printUsage()
 		return 0
 	}
 	switch args[0] {
+	case "help", "-h", "--help":
+		printUsage()
+		return 0
 	case "connect":
 		return runConnect([]string{"-h"})
 	case "status":
@@ -195,7 +225,7 @@ func runHelp(args []string) int {
 	case "cp":
 		return runCP([]string{"-h"})
 	case "doctor":
-		_, _ = io.WriteString(os.Stderr, "Usage: ts-unplug-proxy doctor -dir <state-dir> [-socks5 <addr>] [-http <addr>] [-L <local=remote>] [-pac-addr <addr>] [-pac-domain <a,b>] [-hostname <name>] [-advertise-tags <tags>] [-accept-routes] [-disable-interface-binding] [-allow-non-loopback]\n\nInspects the state directory, persisted exit-node prefs, listener safety, PAC decisions, and (when no daemon holds the state-dir lock) advertised/accepted routes.\n")
+		printDoctorUsage()
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "ts-unplug-proxy help: unknown subcommand %q\n\n", args[0])

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"strings"
 	"time"
 
@@ -35,6 +37,7 @@ type doctor struct {
 	pacDomains       []string
 	forwards         forwardList
 	allowNonLoopback bool
+	uninitialized    bool
 
 	problems int
 	warnings int
@@ -107,6 +110,11 @@ func (d *doctor) checkState() {
 	d.info("state dir: %s", d.dir)
 	sf, err := loadStateFile(d.dir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			d.uninitialized = true
+			d.warn("state file does not exist yet (node has not started/logged in)")
+			return
+		}
 		d.fail("cannot read state: %v", err)
 		return
 	}
@@ -231,6 +239,10 @@ func (d *doctor) checkPAC() {
 func (d *doctor) checkRoutes() {
 	if d.dir == "" {
 		d.warn("skipping route check: no -dir")
+		return
+	}
+	if d.uninitialized {
+		d.warn("skipping online route check: state dir is not yet initialized")
 		return
 	}
 	// The state file has no cross-process lock, so a second tsnet on the same

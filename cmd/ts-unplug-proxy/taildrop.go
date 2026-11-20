@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -317,6 +318,24 @@ func runFileCPIO(args []string, stdin io.Reader, stdout, stderr io.Writer, cmdNa
 		}
 	}
 
+	// Pre-validate all local file sources before transferring anything so a
+	// missing path or directory later in the argument list fails cleanly
+	// without partial transfers.
+	for _, src := range files {
+		if src == "-" {
+			continue
+		}
+		fi, err := os.Stat(src)
+		if err != nil {
+			fmt.Fprintf(stderr, "ts-unplug-proxy %s: %v\n", cmdName, err)
+			return 1
+		}
+		if fi.IsDir() {
+			fmt.Fprintf(stderr, "ts-unplug-proxy %s: cannot send %q: directories are not supported\n", cmdName, src)
+			return 1
+		}
+	}
+
 	sockPath, err := resolveControlSocket(*sockFlag, *dirFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "ts-unplug-proxy %s: %v\n", cmdName, err)
@@ -541,6 +560,14 @@ func runFileGetIO(args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 
+		// Sync the destination directory so the new directory entry is durable
+		// before removing the staged copy from the daemon.
+		if err := syncDir(cleanDestDir); err != nil {
+			fmt.Fprintf(stderr, "ts-unplug-proxy file get: saved %s, but failed to sync destination directory (leaving staged file in daemon): %v\n", finalName, err)
+			hadErr = true
+			continue
+		}
+
 		if !*keepFlag {
 			if err := lc.DeleteWaitingFile(ctx, wf.Name); err != nil {
 				fmt.Fprintf(stderr, "ts-unplug-proxy file get: saved %s, but failed to delete from daemon: %v\n", finalName, formatLocalAPIError(sockPath, err))
@@ -615,7 +642,7 @@ func commitTaildropFile(tmpPath, destDir, safeName, conflict string) (finalName 
 		return safeName, false, nil
 
 	case "rename":
-		for i := 0; i <= maxTaildropRenameAttempts; i++ {
+		for i := 0; i < maxTaildropRenameAttempts; i++ {
 			candName := renameCandidate(safeName, i)
 			candPath := filepath.Join(destDir, candName)
 			if err := placeFileExclusive(tmpPath, candPath); err == nil {
@@ -629,6 +656,28 @@ func commitTaildropFile(tmpPath, destDir, safeName, conflict string) (finalName 
 	default:
 		return "", false, fmt.Errorf("unsupported conflict policy %q", conflict)
 	}
+}
+
+// syncDir flushes the directory entry metadata to disk on platforms/filesystems
+// that support fsyncing directories. Unsupported-operation errors (for example
+// on Windows or virtual filesystems) are ignored.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		if errors.Is(syncErr, syscall.EINVAL) || errors.Is(syncErr, syscall.ENOTSUP) || errors.Is(syncErr, syscall.EPERM) || errors.Is(syncErr, syscall.EBADF) {
+			return closeErr
+		}
+		return syncErr
+	}
+	return closeErr
 }
 
 // placeFileExclusive atomically moves tmpPath to destPath only if destPath does

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -119,7 +120,7 @@ func (c pacConfig) script() string {
 	b.WriteString("  return h;\n")
 	b.WriteString("}\n")
 	b.WriteString("var tsnetSuffixes = [" + jsStringList(c.effectiveSuffixes()) + "];\n")
-	b.WriteString("var tsnetProxies = \"" + c.proxyList() + "\";\n")
+	b.WriteString("var tsnetProxies = " + strconv.Quote(c.proxyList()) + ";\n")
 	b.WriteString("function FindProxyForURL(url, host) {\n")
 	b.WriteString("  host = normalizeHost(host);\n")
 	b.WriteString("  for (var i = 0; i < tsnetSuffixes.length; i++) {\n")
@@ -158,7 +159,7 @@ func (c pacConfig) match(host string) string {
 func jsStringList(items []string) string {
 	quoted := make([]string, 0, len(items))
 	for _, s := range items {
-		quoted = append(quoted, `"`+strings.ReplaceAll(s, `"`, `\"`)+`"`)
+		quoted = append(quoted, strconv.Quote(s))
 	}
 	return strings.Join(quoted, ", ")
 }

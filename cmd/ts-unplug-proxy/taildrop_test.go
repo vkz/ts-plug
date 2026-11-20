@@ -649,9 +649,13 @@ func TestFileCPErrors(t *testing.T) {
 		t.Errorf("unknown peer stderr = %q, want available target names listed", stderr.String())
 	}
 
-	// Directory rejected cleanly (no upload performed).
+	// Directory rejected cleanly (no upload performed), even when preceded by a valid file.
+	goodFile := filepath.Join(filepath.Dir(subDir), "good.txt")
+	if err := os.WriteFile(goodFile, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	stderr.Reset()
-	code = runFileIO([]string{"cp", "-socket", m.sockPath, subDir, "laptop:"}, strings.NewReader(""), &stdout, &stderr)
+	code = runFileIO([]string{"cp", "-socket", m.sockPath, goodFile, subDir, "laptop:"}, strings.NewReader(""), &stdout, &stderr)
 	if code != 1 {
 		t.Errorf("directory exit = %d, want 1", code)
 	}

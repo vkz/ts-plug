@@ -186,6 +186,7 @@ func TestEnvPrintAndShellQuoting(t *testing.T) {
 			t.Errorf("unexpected stderr: %q", stderr.String())
 		}
 		want := strings.Join([]string{
+			"unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy",
 			"export ALL_PROXY='socks5h://127.0.0.1:1080'",
 			"export NO_PROXY='localhost,127.0.0.1,::1'",
 			"export all_proxy='socks5h://127.0.0.1:1080'",
@@ -193,6 +194,42 @@ func TestEnvPrintAndShellQuoting(t *testing.T) {
 		}, "\n") + "\n"
 		if stdout.String() != want {
 			t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
+		}
+	})
+
+	t.Run("socks5-only clears stale inherited HTTP(S)_PROXY", func(t *testing.T) {
+		baseEnv := []string{
+			"PATH=/usr/bin:/bin",
+			"HTTP_PROXY=http://corp-proxy:3128",
+			"http_proxy=http://corp-proxy:3128",
+			"HTTPS_PROXY=http://corp-proxy:3128",
+			"https_proxy=http://corp-proxy:3128",
+			"KEEP_ME=yes",
+		}
+		var gotEnv []string
+		runner := func(cmdArgs, env []string) (int, error) {
+			gotEnv = env
+			return 0, nil
+		}
+		var stdout, stderr bytes.Buffer
+		code := runEnvIO([]string{"-socks5", "127.0.0.1:1080", "--", "curl", "https://gxa.ts.net"}, baseEnv, &stdout, &stderr, runner)
+		if code != 0 {
+			t.Fatalf("exit = %d, stderr = %q", code, stderr.String())
+		}
+		envMap := make(map[string]string, len(gotEnv))
+		for _, kv := range gotEnv {
+			k, v, ok := strings.Cut(kv, "=")
+			if ok {
+				envMap[k] = v
+			}
+		}
+		for _, stale := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"} {
+			if val, exists := envMap[stale]; exists {
+				t.Errorf("stale %s=%q leaked into SOCKS5-only child env", stale, val)
+			}
+		}
+		if envMap["ALL_PROXY"] != "socks5h://127.0.0.1:1080" || envMap["KEEP_ME"] != "yes" {
+			t.Errorf("unexpected child env: %v", envMap)
 		}
 	})
 

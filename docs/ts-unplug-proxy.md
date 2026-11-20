@@ -238,7 +238,7 @@ All CLI subcommands (`status`, `peers`, `ping`, `login`, `conns`, `env`, `file`,
 4. `$TS_UNPLUG_PROXY_DIR/control.sock`
 5. `${XDG_STATE_HOME:-~/.local/state}/ts-unplug-proxy/control.sock`
 
-Setting `export TS_UNPLUG_PROXY_DIR="$HOME/.local/state/tsnet-proxy"` in your
+Setting `export TS_UNPLUG_PROXY_DIR="$HOME/.local/state/ts-unplug-proxy"` (or your custom `-dir` path) in your
 shell profile enables zero-flag CLI commands.
 
 ### Inspecting Status, Peers, Latency, and Connections
@@ -288,7 +288,9 @@ address is checked by the loopback safety rail (non-loopback requires
 ## One-Shot Proxy Wrapper (`env`)
 
 Run a single command with `ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, and
-`NO_PROXY` configured without polluting your global shell environment:
+`NO_PROXY` configured without polluting your global shell environment (in
+SOCKS5-only mode, inherited `HTTP_PROXY`/`HTTPS_PROXY` are unset so they cannot
+override `ALL_PROXY`):
 
 ```sh
 # Auto-discovers listeners from the running daemon's control socket

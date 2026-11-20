@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type controlListener struct {
@@ -41,6 +42,12 @@ func listenControlSocket(sockPath string) (net.Listener, error) {
 	if fi, err := os.Lstat(sockPath); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("refusing to remove non-socket path %q for control socket", sockPath)
+		}
+		// Guard against stomping a live daemon when a custom -control-sock is
+		// shared across different -dir values.
+		if probe, dialErr := net.DialTimeout("unix", sockPath, 200*time.Millisecond); dialErr == nil {
+			_ = probe.Close()
+			return nil, fmt.Errorf("control socket %q is already in use by another process", sockPath)
 		}
 		if err := os.Remove(sockPath); err != nil {
 			return nil, fmt.Errorf("remove stale control socket %q: %w", sockPath, err)
