@@ -1,16 +1,36 @@
 # ts-unplug-proxy Guide
 
-**ts-unplug-proxy** runs local SOCKS5 and/or HTTP proxies that dial requested destinations through a `tsnet.Server`.
+**ts-unplug-proxy** runs local SOCKS5/HTTP/PAC proxies, static TCP port forwards,
+and a full set of tailnet CLI tools (`status`, `peers`, `ping`, `login`,
+`conns`, `env`, `connect`, `file`/`cp`, `doctor`) through a single userspace
+`tsnet.Server` — no kernel `tailscaled` required.
 
 ## Overview
 
 ts-unplug-proxy allows you to:
-- Use one local proxy process for many tailnet services
-- Let proxy-aware tools choose the remote hostname and port
+- Use one userspace `tsnet` node for browsers (PAC/HTTP), SSH (`connect -fdpass`), CLI tools (`env`), and TCP apps (`-L` forwards)
+- Inspect and operate your tailnet (`status`, `peers`, `ping`, `login`, `conns`, `file`/`cp` Taildrop) even on machines where `tailscaled` and the `tailscale` CLI cannot run
 - Resolve tailnet hostnames through Tailscale status/DNS instead of local DNS
-- Avoid running one fixed local port mapping per remote service
+- Stay completely out of the host kernel routing table (coexisting cleanly with Cloudflare WARP/One)
 
-This differs from `ts-unplug`, which maps one local TCP port to one fixed remote target.
+## Subcommand Reference
+
+Run `ts-unplug-proxy <subcommand> -h` (or `ts-unplug-proxy help <subcommand>`) for complete flags and examples.
+
+| Subcommand | Purpose |
+|------------|---------|
+| *(default)* | Run the daemon (`-dir` + `-socks5`, `-http`, and/or `-L`) |
+| `connect` | OpenSSH `ProxyCommand` helper supporting `ProxyUseFdpass yes` (`-fdpass`) |
+| `status` | Show daemon state, hostname, listeners, `key_expiry` warning, and active connection count |
+| `peers` | List tailnet peers, IPs, online status, and direct vs DERP relay path |
+| `ping` | Ping a peer via the running daemon to check latency and direct vs DERP |
+| `login` | Display (and optionally `-open`) the Tailscale auth URL and wait until Ready |
+| `conns` | List active tunneled connections (protocol, target, age, bytes in/out) |
+| `env` | Run a one-shot command with `ALL_PROXY`/`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` set (or `-print` exports) |
+| `file` | Taildrop transfers: `file cp`, `file get`, `file ls`, `file targets` |
+| `cp` | Shorthand alias for `file cp` (`ts-unplug-proxy cp <file...> <peer>:`) |
+| `doctor` | Diagnose state dir, persisted exit-node prefs, listeners, PAC, and routes |
+| `help` | Print help for the root command or any subcommand |
 
 ## Installation
 
@@ -65,6 +85,7 @@ ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:1080
 - At least one listener flag:
   - `-socks5 <listen:port>` - Enable a SOCKS5 proxy listener
   - `-http <listen:port>` - Enable an HTTP proxy listener
+  - `-L <local=remote>` - Static local TCP port forward (repeatable, e.g. `-L 127.0.0.1:7687=neo4j.wild-dojo.ts.net:7687`). Can be used alongside proxies or standalone (`-L`-only mode).
 
 ### Optional
 
@@ -72,7 +93,11 @@ ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:1080
 
 - `-advertise-tags <tag:a,tag:b>` - Comma-separated Tailscale ACL tags to advertise on this node (for example `tag:laptop-proxy`). Required if your tailnet ACLs or Tailscale SSH rules grant access to tag-based sources rather than personal user identities.
 
-- `-dial-timeout <duration>` - Timeout for dialing destinations through `tsnet` (default: `30s`). Applies to both SOCKS5 and HTTP CONNECT dials.
+- `-dial-timeout <duration>` - Timeout for dialing destinations through `tsnet` (default: `30s`). Applies to SOCKS5, HTTP CONNECT, and `-L` forwards.
+
+- `-control-sock <path>` - Override the Unix control socket path (default `<dir>/control.sock` on Unix). Useful if `-dir` is deep and approaches macOS's 104-byte Unix socket path limit.
+
+- `-tailnet-only` - Enforce destination IP allowlisting at the proxy: allow only Tailscale CGNAT (`100.64.0.0/10`), Tailscale IPv6 (`fd7a:115c:a1e0::/48`), and (when `-accept-routes` is set) non-default peer `PrimaryRoutes` prefixes. Rejects public hostnames/IPs and unresolved fallback dials. Mutually exclusive with `-exit-node` and `-direct`.
 
 - `-v` - Log proxy connections and proxy dials
   ```sh
@@ -88,17 +113,17 @@ ts-unplug-proxy -dir ./state -socks5 127.0.0.1:1080 -http 127.0.0.1:1080
 
 - `-disable-interface-binding` - On macOS, disable Tailscale's network namespace integration, including physical-interface binding. Use this when another network tunnel controls the system's interface and route selection.
 
-- `-pac-addr <addr>` - Serve `/proxy.pac` on this address (loopback only). Browsers that use the PAC send only tailnet hosts through the proxy.
+- `-pac-addr <addr>` - Serve `/proxy.pac` and read-only `/status` on this address (loopback only unless `-allow-non-loopback`). Requires `-socks5` or `-http`. Works even on a fresh `-dir` without `-pac-domain`: MagicDNS suffixes are discovered dynamically once the netmap arrives.
 
-- `-pac-domain <a,b>` - Comma-separated tailnet DNS suffixes the PAC must never send `DIRECT`. Defaults to the MagicDNS name recorded in `-dir`.
+- `-pac-domain <a,b>` - Comma-separated tailnet DNS suffixes the PAC must never send `DIRECT`. Optional: defaults to the MagicDNS name recorded in `-dir` or discovered live from the netmap.
 
-- `-exit-node` - Use a tailnet exit node for non-tailnet egress. Off by default. See [Exit nodes and persisted prefs](#exit-nodes-and-persisted-prefs).
+- `-exit-node` - Use a tailnet exit node for non-tailnet egress. Off by default. Mutually exclusive with `-tailnet-only`. See [Exit nodes and persisted prefs](#exit-nodes-and-persisted-prefs).
 
 - `-clear-exit-node` - One-shot: clear a persisted exit-node preference from `-dir`, then exit. Stop the proxy first.
 
-- `-direct` - Force non-tailnet names through the OS resolver and dialer. Off by default and rarely needed: without an exit node, non-tailnet traffic already egresses via the OS. Does not apply to IP literals.
+- `-direct` - Force non-tailnet names through the OS resolver and dialer. Off by default and rarely needed: without an exit node, non-tailnet traffic already egresses via the OS. Does not apply to IP literals. Mutually exclusive with `-tailnet-only`.
 
-- `-allow-non-loopback` - Allow `-socks5`/`-http`/`-pac-addr` to bind non-loopback addresses. Off by default.
+- `-allow-non-loopback` - Allow `-socks5`/`-http`/`-pac-addr`/`-L` to bind non-loopback addresses. Off by default. When `-pac-addr` is non-loopback, `/status` over TCP omits `auth_url`.
 
 - `-version` - Print version and build information, then exit.
 
@@ -119,10 +144,22 @@ Then set the browser's automatic proxy configuration URL to
 The PAC is served as soon as the process binds its listeners, before tsnet has
 connected, so a browser never falls back to `DIRECT` because the PAC was
 momentarily unavailable. While tsnet connects, tailnet requests queue rather
-than leaking. `GET /status` on the same address returns a JSON health document
-(`ready`, `serving`, `hostname`, `backend_state`, `auth_url`, `route_all`,
-`exit_node`, `suffixes`, `proxies`, `version`) and returns HTTP `200` only when
-the backend is `Running` and the proxy listeners are accepting connections.
+than leaking. Even on a brand-new `-dir` with no `-pac-domain` flag, the initial
+PAC fails closed for `.ts.net`, `100.64.0.0/10`, and `fd7a:115c:a1e0::/48`; once
+the netmap arrives, the daemon atomically updates the served PAC, `/status`, and
+the dialer with the discovered MagicDNS suffix (merging any explicit
+`-pac-domain` values). Note that browsers may cache a PAC briefly until they
+refresh it, so passing `-pac-domain` is still recommended if you use a custom
+non-`.ts.net` suffix and want it active on the very first request.
+
+`GET /status` on the PAC address returns a read-only JSON health document
+(`ready`, `serving`, `hostname`, `backend_state`, `auth_url`, `key_expiry`,
+`active_connections`, `socks5_addr`, `http_addr`, `control_sock`, `forwards`,
+`tailnet_only`, `route_all`, `exit_node`, `suffixes`, `proxies`, `version`) and
+returns HTTP `200` only when the backend is `Running` and the proxy listeners
+are accepting connections. When `-pac-addr` is bound to a non-loopback address,
+`auth_url` is omitted from TCP `/status` (it remains available on the `0600` Unix
+control socket).
 
 The PAC fails closed: any host under a configured suffix or `.ts.net`, and any
 literal address in `100.64.0.0/10` (Tailscale node IPs and Service VIPs), is
@@ -172,6 +209,145 @@ It reports:
 - the exact PAC decisions for sample hosts (tailnet, CGNAT, and public),
 - advertised routes, and accepted routes with a warning when `RouteAll` pulls
   in non-tailnet (corporate) CIDRs.
+
+## Control Socket & Tailnet CLI (`status`, `peers`, `ping`, `login`, `conns`)
+
+On Unix (macOS/Linux), the running daemon serves a `0600` control socket at
+`<dir>/control.sock` (override with `-control-sock`). It starts immediately
+after taking the state-dir lock — before `ts.Up` finishes — so `status` and
+`login` work while the node is in `NeedsLogin`.
+
+The control socket reverse-proxies `/localapi/` to the in-process `tsnet`
+LocalAPI and serves `/status` and `/debug/connections`. Privileged operations
+(`peers`, `ping`, `login`, connection targets, and Taildrop) are served **only**
+on this `0600` Unix socket, never on the TCP `-pac-addr` listener, preventing
+browser CSRF or DNS rebinding.
+
+> Because `/localapi/` is exposed natively on `<dir>/control.sock`, even the
+> stock `tailscale` CLI works against the running daemon:
+> `tailscale --socket ~/.local/state/ts-unplug-proxy/control.sock status`
+
+### Control Socket Discovery
+
+All CLI subcommands (`status`, `peers`, `ping`, `login`, `conns`, `env`, `file`,
+`cp`) locate the daemon socket in this order:
+
+1. `-socket <path>`
+2. `-dir <dir>` (uses `<dir>/control.sock`)
+3. `$TS_UNPLUG_PROXY_SOCK`
+4. `$TS_UNPLUG_PROXY_DIR/control.sock`
+5. `${XDG_STATE_HOME:-~/.local/state}/ts-unplug-proxy/control.sock`
+
+Setting `export TS_UNPLUG_PROXY_DIR="$HOME/.local/state/tsnet-proxy"` in your
+shell profile enables zero-flag CLI commands.
+
+### Inspecting Status, Peers, Latency, and Connections
+
+```sh
+# Health summary + key_expiry warning (exits 0 when Running & serving, 1 otherwise)
+ts-unplug-proxy status
+ts-unplug-proxy status -json
+
+# Log in interactively (prints auth URL, optionally opens browser, waits until Ready)
+ts-unplug-proxy login -open
+
+# List peers, IPs, online state, and direct vs DERP relay path
+ts-unplug-proxy peers
+ts-unplug-proxy peers -online
+ts-unplug-proxy peers -json
+
+# Ping a peer through the running daemon (shows RTT and direct vs DERP)
+ts-unplug-proxy ping gxa
+ts-unplug-proxy ping -c 5 -type disco 100.64.0.10
+
+# Inspect live tunneled connections (SOCKS5, HTTP, and -L forwards)
+ts-unplug-proxy conns
+ts-unplug-proxy conns -json
+```
+
+## Static Local TCP Port Forwards (`-L`)
+
+For proxy-unaware TCP tools (database drivers such as Neo4j Bolt or `psql`,
+Redis, DB GUIs, local scripts), pass repeatable `-L <local-addr>=<remote:port>`
+flags to reuse the same `tsnet` node without running a separate `ts-unplug`
+process:
+
+```sh
+ts-unplug-proxy -dir ~/.local/state/ts-unplug-proxy \
+  -socks5 127.0.0.1:1080 \
+  -L 127.0.0.1:7687=neo4j.wild-dojo.ts.net:7687 \
+  -L 127.0.0.1:5432=pg.wild-dojo.ts.net:5432 \
+  -disable-interface-binding
+```
+
+`-L` also works standalone (without `-socks5` or `-http`). Every local bind
+address is checked by the loopback safety rail (non-loopback requires
+`-allow-non-loopback`), relays with full-duplex TCP half-close, and appears in
+`ts-unplug-proxy conns`.
+
+## One-Shot Proxy Wrapper (`env`)
+
+Run a single command with `ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY` configured without polluting your global shell environment:
+
+```sh
+# Auto-discovers listeners from the running daemon's control socket
+ts-unplug-proxy env -- curl https://gxa.wild-dojo.ts.net/
+ts-unplug-proxy env -- git fetch origin
+
+# Print POSIX export statements for a subshell
+eval "$(ts-unplug-proxy env -print)"
+
+# Explicit listeners or extra NO_PROXY entries
+ts-unplug-proxy env -socks5 127.0.0.1:1080 -http 127.0.0.1:8080 -no-proxy ".corp.local" -- npm test
+```
+
+> Note: if the daemon was started with `-tailnet-only`, commands run under `env`
+> will have non-tailnet requests rejected by the proxy.
+
+## Tailnet-Only Guard (`-tailnet-only`)
+
+Pass `-tailnet-only` to enforce destination IP allowlisting at the proxy itself
+(defense-in-depth if an app is pointed globally at `127.0.0.1:1080`):
+
+- Allows only Tailscale IPv4 (`100.64.0.0/10`), Tailscale IPv6
+  (`fd7a:115c:a1e0::/48`), and — when `-accept-routes` is also enabled —
+  non-default (`Bits() > 0`) peer `PrimaryRoutes` prefixes.
+- Enforces the check on the **final normalized IP** (not hostname alone) and
+  disables unresolved fallback dials, so public hostnames and public IP literals
+  are always rejected.
+- Mutually exclusive with `-exit-node` and `-direct`.
+
+## Taildrop File Transfers (`file` / `cp`)
+
+`ts-unplug-proxy` registers Tailscale's Taildrop extension on its `tsnet` node,
+so you can send and receive files directly from a machine behind WARP:
+
+```sh
+# List eligible Taildrop targets
+ts-unplug-proxy file targets
+
+# Send one or more files (destination must end with ':')
+ts-unplug-proxy cp report.pdf gxa:
+ts-unplug-proxy file cp a.txt b.txt gxa.wild-dojo.ts.net:
+echo "hello" | ts-unplug-proxy cp -name note.txt - gxa:
+
+# List waiting incoming files
+ts-unplug-proxy file ls
+
+# Receive waiting files safely into ~/Downloads (default conflict policy: skip)
+ts-unplug-proxy file get ~/Downloads
+ts-unplug-proxy file get -conflict rename ~/Downloads
+ts-unplug-proxy file get -conflict overwrite -keep ~/Downloads
+```
+
+Safety & caveats:
+- `file get` strictly rejects unsafe filenames (path separators, `..`, NUL
+  bytes), streams to a temp file in the destination directory with `fsync` +
+  atomic placement, and deletes the staged file from the daemon **only** after
+  durable write succeeds (unless `-keep` is passed).
+- Taildrop transfers require untagged user-owned nodes (or explicit Tailscale
+  ACL file-sharing capabilities when using `-advertise-tags`).
 
 ## SSH over ts-unplug-proxy
 

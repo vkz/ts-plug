@@ -122,6 +122,24 @@ func main() {
 		switch os.Args[1] {
 		case "connect":
 			os.Exit(runConnect(os.Args[2:]))
+		case "status":
+			os.Exit(runStatus(os.Args[2:]))
+		case "peers":
+			os.Exit(runPeers(os.Args[2:]))
+		case "ping":
+			os.Exit(runPing(os.Args[2:]))
+		case "login":
+			os.Exit(runLogin(os.Args[2:]))
+		case "conns":
+			os.Exit(runConns(os.Args[2:]))
+		case "env":
+			os.Exit(runEnv(os.Args[2:]))
+		case "file":
+			os.Exit(runFile(os.Args[2:]))
+		case "cp":
+			os.Exit(runCP(os.Args[2:]))
+		case "help":
+			os.Exit(runHelp(os.Args[2:]))
 		case "doctor":
 			doctorMode = true
 			os.Args = append(os.Args[:1], os.Args[2:]...)

@@ -9,7 +9,7 @@ One-liner tools to expose things to/from your tailnet!
 |--------|---------|----------|
 | **ts-plug** | Expose localhost to your tailnet | Share your dev server to your tailnet, deploy without sidecars |
 | **ts-unplug** | Bring tailnet services to localhost | Access tailnet-based databases/APIs as if they were local |
-| **ts-unplug-proxy** | SOCKS5/HTTP proxy into your tailnet | Route proxy-aware clients to many tailnet services |
+| **ts-unplug-proxy** | Userspace SOCKS5/HTTP/PAC proxy, TCP forwarder & tailnet CLI | Reach tailnet web apps, SSH (`connect -fdpass`), TCP services (`-L`), CLI tools (`env`), and Taildrop (`file`/`cp`) without `tailscaled` |
 
 ## Quick Start
 
@@ -53,9 +53,11 @@ curl -x http://localhost:8080 http://api.tailnet-name.ts.net
 - Simple port mapping
 
 **ts-unplug-proxy** provides:
-- Local SOCKS5 and HTTP proxies into the tailnet
-- One proxy for multiple tailnet destinations
-- Optional shared listener port for SOCKS5 and HTTP
+- Local SOCKS5, HTTP CONNECT, and dynamic fail-closed PAC proxies into the tailnet
+- Static local TCP port forwards (`-L local=remote`) and `-tailnet-only` destination guard
+- Built-in OpenSSH `ProxyCommand` helper with `ProxyUseFdpass` (`connect -fdpass`)
+- Tailnet CLI over a `0600` Unix control socket (`status`, `peers`, `ping`, `login`, `conns`, `env`, `file`/`cp` Taildrop, `doctor`)
+- Coexistence with macOS tunnels like Cloudflare WARP (`-disable-interface-binding`)
 
 ## Examples
 
