@@ -741,3 +741,85 @@ func TestDoctorPopulateFromRunningDaemon(t *testing.T) {
 		t.Errorf("checkListeners on discovered live listeners: problems = %d, want 0", d.problems)
 	}
 }
+
+func TestDoctorCheckRoutesReadOnlyOfflineAndLiveSocket(t *testing.T) {
+	// 1. Offline with existing state file and probeRoutes=false: returns
+	// immediately without mutating state dir or starting tsnet.
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, stateFileName)
+	orig := []byte(`{"_current-profile":"cHJvZmlsZS0x","profile-1":"e30="}`)
+	if err := os.WriteFile(statePath, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dOff := &doctor{dir: dir, probeRoutes: false}
+	start := time.Now()
+	dOff.checkRoutes()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("offline read-only checkRoutes took %v, expected instant return", elapsed)
+	}
+	if dOff.problems != 0 {
+		t.Errorf("offline read-only checkRoutes problems = %d, want 0", dOff.problems)
+	}
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, orig) {
+		t.Errorf("offline checkRoutes mutated state file")
+	}
+
+	// 2. Running daemon: reads live routes from control socket /localapi/v0/status
+	// and warns on non-tailnet peer routes when RouteAll is enabled.
+	mockLocalMux := http.NewServeMux()
+	mockLocalMux.HandleFunc("/localapi/v0/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"BackendState": "Running",
+			"Self": {"HostName": "doc-proxy"},
+			"Peer": {
+				"nodekey:1": {
+					"HostName": "router",
+					"PrimaryRoutes": ["172.31.0.0/20"]
+				}
+			}
+		}`)
+	})
+	mockLocalLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockLocalLn.Close()
+	mockLocalSrv := &http.Server{Handler: mockLocalMux}
+	go func() { _ = mockLocalSrv.Serve(mockLocalLn) }()
+	defer mockLocalSrv.Close()
+
+	sockPath := shortSockPath(t, "doc-routes.sock")
+	ctrlLn, err := listenControlSocket(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+
+	localDial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var nd net.Dialer
+		return nd.DialContext(ctx, "tcp", mockLocalLn.Addr().String())
+	}
+	st := &statusState{hostname: "doc-proxy", controlSock: sockPath}
+	st.setServing()
+	ctrlSrv := &http.Server{Handler: newControlMux(localDial, st, newConnTracker())}
+	go func() { _ = ctrlSrv.Serve(ctrlLn) }()
+	defer ctrlSrv.Close()
+
+	dLive := &doctor{controlSock: sockPath, acceptRoutes: true}
+	dLive.populateFromRunningDaemon()
+	if dLive.liveStatus == nil {
+		t.Fatal("expected liveStatus populated from running daemon")
+	}
+	dLive.checkRoutes()
+	if dLive.problems != 0 {
+		t.Errorf("live checkRoutes problems = %d, want 0", dLive.problems)
+	}
+	if dLive.warnings == 0 {
+		t.Error("expected warning for non-tailnet 172.31.0.0/20 peer route")
+	}
+}

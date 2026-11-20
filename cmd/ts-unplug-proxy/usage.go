@@ -184,12 +184,16 @@ OPTIONS
   -hostname <name>            override persisted hostname for online route probe
   -advertise-tags <tag:a,...> override persisted tags for online route probe
   -accept-routes              report advertised/accepted peer routes
+  -probe-routes               when no daemon is running, start a temporary tsnet
+                              probe to inspect routes (off by default so offline
+                              doctor stays fast and strictly read-only)
   -disable-interface-binding  disable macOS network namespace binding during probe
   -allow-non-loopback         allow non-loopback listeners (warns instead of failing)
 
-Checks state prefs offline and only opens tsnet for the route check when no
-running daemon holds the state-dir lock (preserving persisted Hostname and
-AdvertiseTags unless overridden, and restoring the state file afterwards).
+Strictly read-only by default: reads persisted prefs offline and queries live
+listeners and routes over the control socket when a daemon is running. When no
+daemon is running, pass -probe-routes to opt into a temporary tsnet route probe
+(which preserves persisted Hostname/AdvertiseTags and restores prefs afterwards).
 `
 
 func printDoctorUsage() {

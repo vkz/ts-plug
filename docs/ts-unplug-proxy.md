@@ -190,16 +190,25 @@ ts-unplug-proxy -dir ./state -clear-exit-node
 
 ## Diagnosing with `doctor`
 
-`doctor` inspects the state dir, listeners, PAC and routes, and exits non-zero
-on problems. It reads prefs offline and only opens tsnet for the route check
-when it can take the state-dir lock (i.e. the proxy is not running). During the
-online route probe it reuses the persisted `Hostname` and `AdvertiseTags` from
-`-dir` unless overridden with `-hostname` / `-advertise-tags`, and restores the
-state file afterwards.
+`doctor` inspects the state dir, listeners, PAC, and routes, and exits non-zero
+on problems. It is **strictly read-only by default**:
+
+- When a daemon is running, `doctor` queries `<dir>/control.sock` to inspect
+  live listeners (when listener flags are omitted) and live routes immediately
+  without touching `-dir`.
+- When no daemon is running, `doctor` runs instant offline checks (state prefs,
+  listener flags, and PAC decisions) without starting `tsnet` or modifying
+  `-dir`. Pass `-probe-routes` if you explicitly want an offline temporary
+  `tsnet` route probe (which reuses persisted `Hostname`/`AdvertiseTags` unless
+  overridden and restores the state file afterwards).
 
 ```sh
-ts-unplug-proxy doctor -dir ./state \
-  -http 127.0.0.1:8080 -pac-addr 127.0.0.1:8099 -pac-domain wild-dojo.ts.net
+# Zero-flag live check against the running daemon (or read-only offline check)
+ts-unplug-proxy doctor
+
+# Offline validation with explicit listener flags (plus optional -probe-routes)
+ts-unplug-proxy doctor -dir ~/.local/state/ts-unplug-proxy \
+  -socks5 127.0.0.1:1080 -http 127.0.0.1:8080 -pac-addr 127.0.0.1:8099
 ```
 
 It reports:

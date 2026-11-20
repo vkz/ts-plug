@@ -57,6 +57,7 @@ var (
 	flagDirect                  = flag.Bool("direct", false, "force non-tailnet names through the OS resolver/dialer (rarely needed; off by default)")
 	flagTailnetOnly             = flag.Bool("tailnet-only", false, "block destinations outside tailnet IPs (and non-default peer routes when -accept-routes is set)")
 	flagAllowNonLoopback        = flag.Bool("allow-non-loopback", false, "allow -socks5/-http/-pac-addr/-L to bind non-loopback addresses")
+	flagProbeRoutes             = flag.Bool("probe-routes", false, "doctor: start a temporary tsnet probe to check routes when no daemon is running")
 	flagVersion                 = flag.Bool("version", false, "print version and build information, then exit")
 )
 

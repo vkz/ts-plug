@@ -22,9 +22,9 @@ import (
 var tailnetV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 
 // doctor inspects the on-disk state and configuration and reports problems. It
-// exits non-zero if it finds any FAIL. It is deliberately offline-first: it
-// only opens tsnet for the route check when it can take the state-dir lock
-// (i.e. no proxy is running).
+// exits non-zero if it finds any FAIL. It is strictly read-only by default:
+// when a daemon is running it inspects live routes over the control socket;
+// when offline it only starts a temporary tsnet probe if -probe-routes is set.
 type doctor struct {
 	dir              string
 	controlSock      string
@@ -38,8 +38,11 @@ type doctor struct {
 	pacDomains       []string
 	forwards         forwardList
 	allowNonLoopback bool
+	probeRoutes      bool
+	acceptRoutes     bool
 	uninitialized    bool
 	discoveredLive   string
+	liveStatus       *statusDocument
 
 	problems int
 	warnings int
@@ -85,6 +88,8 @@ func runDoctor() int {
 		pacDomains:       splitCommaList(*flagPACDomains),
 		forwards:         append(forwardList(nil), flagForwards...),
 		allowNonLoopback: *flagAllowNonLoopback,
+		probeRoutes:      *flagProbeRoutes,
+		acceptRoutes:     *flagAcceptRoutes,
 	}
 	d.populateFromRunningDaemon()
 	fmt.Println("ts-unplug-proxy doctor")
@@ -154,13 +159,10 @@ func (d *doctor) checkState() {
 	}
 }
 
-// populateFromRunningDaemon queries the daemon's control socket when the
-// caller did not specify listener flags explicitly, so bare `doctor` inspects
-// the live daemon's actual listeners instead of reporting "none configured".
+// populateFromRunningDaemon queries the daemon's control socket (if reachable)
+// to capture live status for route checks and, when listener flags were not
+// explicitly passed, discover the daemon's active listeners.
 func (d *doctor) populateFromRunningDaemon() {
-	if d.socksAddr != "" || d.httpAddr != "" || len(d.forwards) > 0 {
-		return
-	}
 	sockPath, err := resolveControlSocket(d.controlSock, d.dir)
 	if err != nil {
 		return
@@ -171,16 +173,19 @@ func (d *doctor) populateFromRunningDaemon() {
 	if err != nil {
 		return
 	}
-	d.discoveredLive = sockPath
-	d.socksAddr = doc.SOCKS5Addr
-	d.httpAddr = doc.HTTPAddr
-	for _, raw := range doc.Forwards {
-		if spec, err := parseForwardSpec(raw); err == nil {
-			d.forwards = append(d.forwards, spec)
+	d.liveStatus = doc
+	if d.socksAddr == "" && d.httpAddr == "" && len(d.forwards) == 0 {
+		d.discoveredLive = sockPath
+		d.socksAddr = doc.SOCKS5Addr
+		d.httpAddr = doc.HTTPAddr
+		for _, raw := range doc.Forwards {
+			if spec, err := parseForwardSpec(raw); err == nil {
+				d.forwards = append(d.forwards, spec)
+			}
 		}
-	}
-	if len(d.pacDomains) == 0 && len(doc.Suffixes) > 0 {
-		d.pacDomains = append([]string(nil), doc.Suffixes...)
+		if len(d.pacDomains) == 0 && len(doc.Suffixes) > 0 {
+			d.pacDomains = append([]string(nil), doc.Suffixes...)
+		}
 	}
 }
 
@@ -278,12 +283,33 @@ func (d *doctor) checkPAC() {
 }
 
 func (d *doctor) checkRoutes() {
+	// If a daemon is already running, read live routes directly over the
+	// control socket (fast and strictly read-only).
+	if d.liveStatus != nil {
+		if sockPath, err := resolveControlSocket(d.controlSock, d.dir); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			st, err := controlLocalClient(sockPath).Status(ctx)
+			cancel()
+			if err == nil && st != nil {
+				d.info("read live routes from running daemon (%s)", sockPath)
+				d.reportRoutes(st, d.acceptRoutes || d.liveStatus.RouteAll)
+				return
+			}
+			d.warn("could not read live routes from control socket (%v); route check skipped", err)
+			return
+		}
+	}
+
 	if d.dir == "" {
 		d.warn("skipping route check: no -dir")
 		return
 	}
 	if d.uninitialized {
 		d.warn("skipping online route check: state dir is not yet initialized")
+		return
+	}
+	if !d.probeRoutes {
+		d.info("daemon is not running; skipping online route probe (pass -probe-routes to start a temporary tsnet probe)")
 		return
 	}
 	// The state file has no cross-process lock, so a second tsnet on the same
@@ -330,41 +356,43 @@ func (d *doctor) checkRoutes() {
 			d.warn("status unavailable; route check skipped")
 			return
 		}
-		if status.Self != nil {
-			selfRoutes := prefixList(status.Self.PrimaryRoutes)
-			if len(selfRoutes) == 0 {
-				d.ok("advertises no routes")
-			} else {
-				d.info("advertised: %s", prefixesString(selfRoutes))
-			}
-		}
-		// Route acceptance is decided by the flags the caller will run the
-		// proxy with, not by the persisted prefs (which tsnet.Up resets).
-		if !*flagAcceptRoutes {
-			d.ok("-accept-routes not set: not accepting peer subnet routes")
-			return
-		}
-		var accepted []netip.Prefix
-		for _, peer := range status.Peer {
-			accepted = append(accepted, prefixList(peer.PrimaryRoutes)...)
-		}
-		if len(accepted) == 0 {
-			d.ok("no subnet routes advertised by peers")
-			return
-		}
-		var nonTailnet []netip.Prefix
-		for _, p := range accepted {
-			if !isTailnetPrefix(p) {
-				nonTailnet = append(nonTailnet, p)
-			}
-		}
-		if len(nonTailnet) > 0 {
-			d.warn("accepting %d non-tailnet route(s): %s; the proxy will send these CIDRs through the tailnet, which can shadow WARP/corporate networks", len(nonTailnet), prefixesString(nonTailnet))
-		} else {
-			d.ok("all %d accepted route(s) are inside tailnet space", len(accepted))
-		}
+		d.reportRoutes(status, d.acceptRoutes)
 	}()
 	d.restorePrefs(snapKey, snapRaw, snapOK)
+}
+
+func (d *doctor) reportRoutes(status *ipnstate.Status, acceptRoutes bool) {
+	if status.Self != nil {
+		selfRoutes := prefixList(status.Self.PrimaryRoutes)
+		if len(selfRoutes) == 0 {
+			d.ok("advertises no routes")
+		} else {
+			d.info("advertised: %s", prefixesString(selfRoutes))
+		}
+	}
+	if !acceptRoutes {
+		d.ok("-accept-routes not set: not accepting peer subnet routes")
+		return
+	}
+	var accepted []netip.Prefix
+	for _, peer := range status.Peer {
+		accepted = append(accepted, prefixList(peer.PrimaryRoutes)...)
+	}
+	if len(accepted) == 0 {
+		d.ok("no subnet routes advertised by peers")
+		return
+	}
+	var nonTailnet []netip.Prefix
+	for _, p := range accepted {
+		if !isTailnetPrefix(p) {
+			nonTailnet = append(nonTailnet, p)
+		}
+	}
+	if len(nonTailnet) > 0 {
+		d.warn("accepting %d non-tailnet route(s): %s; the proxy will send these CIDRs through the tailnet, which can shadow WARP/corporate networks", len(nonTailnet), prefixesString(nonTailnet))
+	} else {
+		d.ok("all %d accepted route(s) are inside tailnet space", len(accepted))
+	}
 }
 
 // probeIdentity resolves the Hostname and AdvertiseTags to use for doctor's
