@@ -20,16 +20,16 @@ WHY THIS EXISTS
   hosts from a browser, CLI, or SSH without installing tailscaled.
 
 USAGE
-  ts-unplug-proxy -dir <state-dir> (-socks5 <addr> | -http <addr>) [-pac-addr <addr>] [options]
+  ts-unplug-proxy -dir <state-dir> (-socks5 <addr> | -http <addr> | -L <local=remote>) [-pac-addr <addr>] [options]
   ts-unplug-proxy connect [-socks5 <addr> | -http <addr>] [-fdpass] [-status <addr>] <host> <port>
-  ts-unplug-proxy doctor -dir <state-dir> [-socks5 <addr>] [-http <addr>] [-pac-addr <addr>] [-hostname <name>] [-advertise-tags <tags>]
+  ts-unplug-proxy doctor -dir <state-dir> [-socks5 <addr>] [-http <addr>] [-L <local=remote>] [-pac-addr <addr>] [-hostname <name>] [-advertise-tags <tags>]
   ts-unplug-proxy -dir <state-dir> -clear-exit-node
   ts-unplug-proxy -version
 
   Subcommands ('connect', 'doctor') must be the first argument. At least one of
-  -socks5 or -http is required to serve; a PAC alone has nothing to route to.
-  Proxy clients choose the destination; serve mode does not take a remote
-  address argument.
+  -socks5, -http, or -L is required to serve; a PAC alone has nothing to route
+  to (and requires -socks5 or -http). Proxy clients choose the destination;
+  serve mode does not take a positional remote address argument.
 
   'connect' is a lightweight client helper for OpenSSH ProxyCommand (run
   'ts-unplug-proxy connect -h' for its flags). With -fdpass and OpenSSH
@@ -43,11 +43,18 @@ LISTENERS
   -http  <addr>    HTTP proxy (absolute-form requests and CONNECT tunnels).
                    CONNECT always carries the hostname, so this is the safest
                    choice for browsers.
+  -L <local=remote> Static local TCP port forward (repeatable), e.g.
+                    -L 127.0.0.1:7687=neo4j.wild-dojo.ts.net:7687.
+  -control-sock <path>
+                    Override path for the Unix control socket (default
+                    <dir>/control.sock on Unix). Serves /localapi/, /status,
+                    and /debug/connections with 0600 permissions.
   -pac-addr <addr> Serve /proxy.pac (and GET /status, a JSON health document)
                    on this address. The PAC sends tailnet hosts to the proxy
                    and everything else DIRECT. It is served before tsnet
                    connects, so a browser never falls back to DIRECT because
-                   the PAC was momentarily unavailable.
+                   the PAC was momentarily unavailable. MagicDNS suffixes are
+                   discovered dynamically once the netmap arrives.
 
 ROUTING AND RESOLUTION
   -dir <path>                    tsnet state directory (required). Holds the
@@ -68,6 +75,11 @@ ROUTING AND RESOLUTION
                                  and dialer. Off by default, and rarely needed:
                                  without an exit node, non-tailnet traffic
                                  already egresses via the OS.
+  -tailnet-only                  Block destinations outside tailnet IPs
+                                 (100.64.0.0/10, fd7a:115c:a1e0::/48, and
+                                 non-default peer routes when -accept-routes
+                                 is set). Mutually exclusive with -exit-node
+                                 and -direct.
   -disable-interface-binding     Disable Tailscale's network-namespace interface
                                  binding. Needed on macOS when another tunnel
                                  (WARP) owns interface/route selection.

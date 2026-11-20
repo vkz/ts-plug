@@ -13,19 +13,23 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/local"
+	_ "tailscale.com/feature/taildrop"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/dnstype"
 )
 
 const (
@@ -43,15 +47,22 @@ var (
 	flagSOCKS5Addr              = flag.String("socks5", "", "SOCKS5 proxy listen address")
 	flagHTTPAddr                = flag.String("http", "", "HTTP proxy listen address")
 	flagPACAddr                 = flag.String("pac-addr", "", "serve /proxy.pac on this listen address")
-	flagPACDomains              = flag.String("pac-domain", "", "comma-separated tailnet DNS suffixes the PAC must never send DIRECT (default: MagicDNS name from -dir)")
+	flagPACDomains              = flag.String("pac-domain", "", "comma-separated tailnet DNS suffixes the PAC must never send DIRECT (default: MagicDNS name from -dir or discovered at runtime)")
+	flagControlSock             = flag.String("control-sock", "", "override path for the control Unix socket (default: <dir>/control.sock)")
+	flagForwards                forwardList
 	flagExitNode                = flag.Bool("exit-node", false, "use a tailnet exit node for non-tailnet egress (off by default)")
 	flagClearExitNode           = flag.Bool("clear-exit-node", false, "one-shot: clear a persisted exit-node preference from -dir, then exit")
 	flagDisableInterfaceBinding = flag.Bool("disable-interface-binding", false, "disable Tailscale's macOS network namespace integration")
 	flagAcceptRoutes            = flag.Bool("accept-routes", false, "accept advertised subnet and Service routes")
 	flagDirect                  = flag.Bool("direct", false, "force non-tailnet names through the OS resolver/dialer (rarely needed; off by default)")
-	flagAllowNonLoopback        = flag.Bool("allow-non-loopback", false, "allow -socks5/-http/-pac-addr to bind non-loopback addresses")
+	flagTailnetOnly             = flag.Bool("tailnet-only", false, "block destinations outside tailnet IPs (and non-default peer routes when -accept-routes is set)")
+	flagAllowNonLoopback        = flag.Bool("allow-non-loopback", false, "allow -socks5/-http/-pac-addr/-L to bind non-loopback addresses")
 	flagVersion                 = flag.Bool("version", false, "print version and build information, then exit")
 )
+
+func init() {
+	flag.Var(&flagForwards, "L", "static local TCP port forward <local-addr>=<remote-host:port> (repeatable)")
+}
 
 type serveResult struct {
 	name string
@@ -59,11 +70,32 @@ type serveResult struct {
 }
 
 type tailnetDialer struct {
-	ts          *tsnet.Server
-	lc          *local.Client
-	direct      bool
-	suffixes    []string
-	dialTimeout time.Duration
+	ts           *tsnet.Server
+	lc           *local.Client
+	direct       bool
+	tailnetOnly  bool
+	acceptRoutes bool
+	suffixesMu   sync.RWMutex
+	suffixes     []string
+	dialTimeout  time.Duration
+
+	// Optional hooks for unit testing without a live tsnet backend.
+	statusFn   func(context.Context) (*ipnstate.Status, error)
+	queryDNSFn func(context.Context, string, string) ([]byte, []*dnstype.Resolver, error)
+	dialTSFn   func(context.Context, string, string) (net.Conn, error)
+}
+
+func (d *tailnetDialer) setSuffixes(suffixes []string) {
+	d.suffixesMu.Lock()
+	d.suffixes = slices.Clone(suffixes)
+	d.suffixesMu.Unlock()
+}
+
+func (d *tailnetDialer) getSuffixes() []string {
+	d.suffixesMu.RLock()
+	out := slices.Clone(d.suffixes)
+	d.suffixesMu.RUnlock()
+	return out
 }
 
 type loggingListener struct {
@@ -124,6 +156,10 @@ func main() {
 		slog.Error("-dial-timeout must be positive")
 		os.Exit(1)
 	}
+	if err := validateFlagCombos(*flagTailnetOnly, *flagExitNode, *flagDirect); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
 	if *flagClearExitNode {
 		lock, err := lockDir(*flagDir)
 		if err != nil {
@@ -140,25 +176,31 @@ func main() {
 	if doctorMode {
 		os.Exit(runDoctor())
 	}
-	if *flagSOCKS5Addr == "" && *flagHTTPAddr == "" {
-		slog.Error("at least one of -socks5 or -http is required")
+	if *flagSOCKS5Addr == "" && *flagHTTPAddr == "" && len(flagForwards) == 0 {
+		slog.Error("at least one of -socks5, -http, or -L is required")
+		os.Exit(1)
+	}
+	if *flagPACAddr != "" && *flagSOCKS5Addr == "" && *flagHTTPAddr == "" {
+		slog.Error("-pac-addr requires at least one of -socks5 or -http")
 		os.Exit(1)
 	}
 	if err := checkLoopbackListeners(); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
-	pacDomains := splitCommaList(*flagPACDomains)
+
+	os.Exit(runDaemon(hostname, advertiseTags))
+}
+
+func runDaemon(hostname string, advertiseTags []string) int {
+	explicitPACDomains := splitCommaList(*flagPACDomains)
+	pacDomains := explicitPACDomains
 	if len(pacDomains) == 0 {
 		if sf, err := loadStateFile(*flagDir); err == nil {
 			if n := sf.magicDNSName(); n != "" {
 				pacDomains = []string{n}
 			}
 		}
-	}
-	if *flagPACAddr != "" && len(pacDomains) == 0 {
-		slog.Error("-pac-addr requires -pac-domain (could not derive a MagicDNS suffix from -dir)")
-		os.Exit(1)
 	}
 	verboseProxy := *flagVerboseProxy || *flagVerboseTSNet
 	if verboseProxy {
@@ -172,11 +214,11 @@ func main() {
 	lock, err := lockDir(*flagDir)
 	if err != nil {
 		slog.Error("cannot use state dir", slog.Any("error", err))
-		os.Exit(1)
+		return 1
 	}
 	defer lock.Close()
 
-	serveErr := make(chan serveResult, 3)
+	serveErr := make(chan serveResult, 4+len(flagForwards))
 	var closers []io.Closer
 	closeAll := func() {
 		for _, c := range closers {
@@ -203,33 +245,65 @@ func main() {
 		// the system's interface and route selection.
 		netns.SetEnabled(false)
 	}
-	// Start the backend without waiting for a connection, so /status can report
-	// progress (including the auth URL) while tsnet connects.
+	// Start the backend without waiting for a connection, so /status and the
+	// control socket can report progress (including the auth URL) while tsnet connects.
 	lc, err := ts.LocalClient()
 	if err != nil {
 		slog.Error("failed to start tsnet backend", slog.Any("error", err))
-		os.Exit(1)
+		return 1
+	}
+	defer func() {
+		if err := ts.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			slog.Warn("error closing tsnet server", slog.Any("error", err))
+		}
+	}()
+
+	tracker := newConnTracker()
+	status := &statusState{
+		lc:          lc,
+		tracker:     tracker,
+		hostname:    hostname,
+		suffixes:    pacDomains,
+		proxies:     pacProxies(*flagSOCKS5Addr, *flagHTTPAddr),
+		socks5Addr:  *flagSOCKS5Addr,
+		httpAddr:    *flagHTTPAddr,
+		forwards:    flagForwards.strings(),
+		tailnetOnly: *flagTailnetOnly,
 	}
 
-	// Bind listeners and serve the PAC before tsnet connects. The PAC is static,
-	// so it is available immediately; tailnet requests then queue (fail closed)
-	// while the node comes up instead of the browser falling back to DIRECT
-	// because it could not fetch the PAC.
-	status := &statusState{
-		lc:       lc,
-		hostname: hostname,
-		suffixes: pacDomains,
-		proxies:  pacProxies(*flagSOCKS5Addr, *flagHTTPAddr),
+	// Start the Unix control socket immediately after lockDir and ts.LocalClient()
+	// (BEFORE ts.Up) so CLI status/login work during NeedsLogin.
+	controlSockPath := strings.TrimSpace(*flagControlSock)
+	if controlSockPath == "" {
+		controlSockPath = filepath.Join(*flagDir, "control.sock")
 	}
+	controlLn, err := listenControlSocket(controlSockPath)
+	if err != nil {
+		slog.Error("failed to listen on control socket", slog.String("socket", controlSockPath), slog.Any("error", err))
+		return 1
+	}
+	if controlLn != nil {
+		closers = append(closers, controlLn)
+		status.setControlSock(controlSockPath)
+		startControlServer(ctx, controlLn, lc.Dial, status, tracker, serveErr)
+		slog.Info("control socket listening", slog.String("socket", controlSockPath))
+	}
+
+	// Bind listeners and serve the PAC before tsnet connects. Pre-Up the PAC
+	// still fails closed on .ts.net, 100.64.0.0/10, and fd7a:115c:a1e0::/48;
+	// after waitForNetmap we atomically swap in the discovered MagicDNS suffix.
+	var pacHold *pacHolder
 	if *flagPACAddr != "" {
 		listener, err := net.Listen("tcp", *flagPACAddr)
 		if err != nil {
 			slog.Error("failed to listen for PAC", slog.String("addr", *flagPACAddr), slog.Any("error", err))
-			os.Exit(1)
+			return 1
 		}
 		closers = append(closers, listener)
 		cfg := pacConfig{suffixes: pacDomains, proxies: status.proxies}
-		startPACServer(listener, cfg.script(), status, verboseProxy, serveErr)
+		pacHold = newPACHolder(cfg)
+		includeAuthURL := isLoopbackListenAddr(*flagPACAddr)
+		startPACServer(listener, pacHold, status, includeAuthURL, verboseProxy, serveErr)
 		slog.Info("PAC listening",
 			slog.String("local", listener.Addr().String()),
 			slog.String("url", "http://"+listener.Addr().String()+"/proxy.pac"),
@@ -242,7 +316,7 @@ func main() {
 		listener, err := net.Listen("tcp", *flagSOCKS5Addr)
 		if err != nil {
 			slog.Error("failed to listen", slog.String("addr", *flagSOCKS5Addr), slog.Any("error", err))
-			os.Exit(1)
+			return 1
 		}
 		closers = append(closers, listener)
 		socksListener, httpListener = proxymux.SplitSOCKSAndHTTP(listener)
@@ -251,7 +325,7 @@ func main() {
 			listener, err := net.Listen("tcp", *flagSOCKS5Addr)
 			if err != nil {
 				slog.Error("failed to listen for SOCKS5", slog.String("addr", *flagSOCKS5Addr), slog.Any("error", err))
-				os.Exit(1)
+				return 1
 			}
 			closers = append(closers, listener)
 			socksListener = listener
@@ -260,23 +334,34 @@ func main() {
 			listener, err := net.Listen("tcp", *flagHTTPAddr)
 			if err != nil {
 				slog.Error("failed to listen for HTTP proxy", slog.String("addr", *flagHTTPAddr), slog.Any("error", err))
-				os.Exit(1)
+				return 1
 			}
 			closers = append(closers, listener)
 			httpListener = listener
 		}
 	}
 
+	// Bind all -L port-forward listeners before ts.Up (fail-closed startup).
+	type boundForward struct {
+		spec     forwardSpec
+		listener net.Listener
+	}
+	boundForwards := make([]boundForward, 0, len(flagForwards))
+	for _, spec := range flagForwards {
+		ln, err := net.Listen("tcp", spec.local)
+		if err != nil {
+			slog.Error("failed to listen for port forward", slog.String("local", spec.local), slog.String("remote", spec.remote), slog.Any("error", err))
+			return 1
+		}
+		closers = append(closers, ln)
+		boundForwards = append(boundForwards, boundForward{spec: spec, listener: ln})
+	}
+
 	upStatus, err := ts.Up(ctx)
 	if err != nil {
 		slog.Error("error starting tsnet server", slog.Any("error", err))
-		os.Exit(1)
+		return 1
 	}
-	defer func() {
-		if err := ts.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			slog.Warn("error closing tsnet server", slog.Any("error", err))
-		}
-	}()
 
 	slog.Info("tsnet server started", slog.String("status", upStatus.BackendState))
 
@@ -286,7 +371,7 @@ func main() {
 			RouteAllSet: true,
 		}); err != nil {
 			slog.Error("failed to enable advertised routes", slog.Any("error", err))
-			os.Exit(1)
+			return 1
 		}
 		slog.Info("advertised subnet and Service routes enabled")
 	}
@@ -295,28 +380,47 @@ func main() {
 			slog.Warn("failed to configure tailnet exit node", slog.Any("error", err))
 		}
 	}
-	dialer := (&tailnetDialer{
-		ts:          ts,
-		lc:          lc,
-		direct:      *flagDirect,
-		suffixes:    pacDomains,
-		dialTimeout: *flagDialTimeout,
-	}).Dial
+
+	td := &tailnetDialer{
+		ts:           ts,
+		lc:           lc,
+		direct:       *flagDirect,
+		tailnetOnly:  *flagTailnetOnly,
+		acceptRoutes: *flagAcceptRoutes,
+		suffixes:     slices.Clone(pacDomains),
+		dialTimeout:  *flagDialTimeout,
+	}
 
 	// Wait briefly for the network map so the first proxied dial does not fail
 	// while tsnet is still applying it. The listeners are already bound and the
 	// PAC is served; early connections queue in the backlog.
-	if st := waitForNetmap(ctx, lc, 10*time.Second); st == nil || st.Self == nil || !st.Self.InNetworkMap {
+	st := waitForNetmap(ctx, lc, 10*time.Second)
+	if st == nil || st.Self == nil || !st.Self.InNetworkMap {
 		slog.Warn("network map not ready after 10s; starting proxy listeners anyway")
 	}
 
-	// tsnet is up; start serving the already-bound proxy listeners.
+	// Dynamically discover MagicDNS suffixes from live Status, merge with any
+	// explicit -pac-domain suffixes, and atomically update PAC, status, and dialer.
+	if liveSuffixes := magicDNSSuffixes(st); len(liveSuffixes) > 0 {
+		merged := mergeSuffixes(explicitPACDomains, pacDomains, liveSuffixes)
+		td.setSuffixes(merged)
+		status.setSuffixes(merged)
+		if pacHold != nil {
+			newCfg := pacConfig{suffixes: merged, proxies: status.proxies}
+			pacHold.Update(newCfg)
+			slog.Info("PAC suffixes updated from live MagicDNS",
+				slog.String("suffixes", strings.Join(newCfg.effectiveSuffixes(), ", ")),
+			)
+		}
+	}
+
+	// tsnet is up; start serving the already-bound proxy and forward listeners.
 	if socksListener != nil {
 		ln := socksListener
 		if verboseProxy {
 			ln = loggingListener{Listener: ln, proxy: "socks5"}
 		}
-		startSOCKS5Proxy(ctx, ln, dialer, serveErr)
+		startSOCKS5Proxy(ctx, ln, tracker.WrapDial("socks5", td.Dial), serveErr)
 		slog.Info("SOCKS5 proxy listening", slog.String("local", ln.Addr().String()))
 	}
 	if httpListener != nil {
@@ -324,19 +428,39 @@ func main() {
 		if verboseProxy {
 			ln = loggingListener{Listener: ln, proxy: "http"}
 		}
-		startHTTPProxy(ctx, ln, dialer, serveErr)
+		startHTTPProxy(ctx, ln, tracker.WrapDial("http", td.Dial), serveErr)
 		slog.Info("HTTP proxy listening", slog.String("local", ln.Addr().String()))
+	}
+	forwardDial := tracker.WrapDial("forward", td.Dial)
+	for _, bf := range boundForwards {
+		startForward(ctx, bf.listener, bf.spec, forwardDial, verboseProxy, serveErr)
+		slog.Info("TCP port forward listening",
+			slog.String("local", bf.listener.Addr().String()),
+			slog.String("remote", bf.spec.remote),
+		)
 	}
 	status.setServing()
 
 	select {
 	case <-ctx.Done():
+		return 0
 	case result := <-serveErr:
 		if result.err != nil && !errors.Is(result.err, net.ErrClosed) && !errors.Is(result.err, http.ErrServerClosed) {
 			slog.Error("proxy stopped with error", slog.String("proxy", result.name), slog.Any("error", result.err))
-			os.Exit(1)
+			return 1
 		}
+		return 0
 	}
+}
+
+func validateFlagCombos(tailnetOnly, exitNode, direct bool) error {
+	if tailnetOnly && exitNode {
+		return errors.New("-tailnet-only cannot be combined with -exit-node")
+	}
+	if tailnetOnly && direct {
+		return errors.New("-tailnet-only cannot be combined with -direct")
+	}
+	return nil
 }
 
 func useExitNodeIfAvailable(ctx context.Context, lc *local.Client) error {
@@ -372,6 +496,33 @@ func (d *tailnetDialer) timeout() time.Duration {
 	return defaultDialTimeout
 }
 
+func (d *tailnetDialer) fetchStatus(ctx context.Context) (*ipnstate.Status, error) {
+	if d.statusFn != nil {
+		return d.statusFn(ctx)
+	}
+	if d.lc == nil {
+		return nil, errors.New("no local client")
+	}
+	return d.lc.Status(ctx)
+}
+
+func (d *tailnetDialer) queryDNS(ctx context.Context, name, queryType string) ([]byte, []*dnstype.Resolver, error) {
+	if d.queryDNSFn != nil {
+		return d.queryDNSFn(ctx, name, queryType)
+	}
+	if d.lc == nil {
+		return nil, nil, errors.New("no local client")
+	}
+	return d.lc.QueryDNS(ctx, name, queryType)
+}
+
+func (d *tailnetDialer) dialTS(ctx context.Context, network, addr string) (net.Conn, error) {
+	if d.dialTSFn != nil {
+		return d.dialTSFn(ctx, network, addr)
+	}
+	return d.ts.Dial(ctx, network, addr)
+}
+
 func (d *tailnetDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, d.timeout())
 	defer cancel()
@@ -381,6 +532,9 @@ func (d *tailnetDialer) Dial(ctx context.Context, network, addr string) (net.Con
 		return nil, err
 	}
 	if !resolved {
+		if d.tailnetOnly {
+			return nil, fmt.Errorf("destination %q blocked by -tailnet-only: unresolved host", addr)
+		}
 		if d.direct {
 			var nd net.Dialer
 			slog.Debug("dialing directly (bypassing tailnet)",
@@ -393,14 +547,57 @@ func (d *tailnetDialer) Dial(ctx context.Context, network, addr string) (net.Con
 			slog.String("network", network),
 			slog.String("addr", addr),
 		)
-		return d.ts.Dial(dialCtx, network, addr)
+		return d.dialTS(dialCtx, network, addr)
 	}
 	slog.Debug("dialing through tailnet",
 		slog.String("network", network),
 		slog.String("addr", addr),
 		slog.String("resolved_addr", resolvedAddr),
 	)
-	return d.ts.Dial(dialCtx, network, resolvedAddr)
+	return d.dialTS(dialCtx, network, resolvedAddr)
+}
+
+// isAllowedTailnetIP reports whether ip is permitted under -tailnet-only.
+// It normalizes IPv4-mapped IPv6 addresses via ip.Unmap() and allows:
+//   - Tailscale IPv4 CGNAT space (100.64.0.0/10)
+//   - Tailscale IPv6 space (fd7a:115c:a1e0::/48)
+//   - Non-default peer PrimaryRoutes (p.Bits() > 0) when acceptRoutes is true
+//
+// Default routes (0.0.0.0/0 and ::/0) are explicitly excluded. When status is
+// nil and ip is outside CGNAT/tailnet-v6, it fails closed (returns false).
+func isAllowedTailnetIP(ip netip.Addr, status *ipnstate.Status, acceptRoutes bool) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	if ip.Is4() && cgnatPrefix.Contains(ip) {
+		return true
+	}
+	if ip.Is6() && tailnetV6.Contains(ip) {
+		return true
+	}
+	if !acceptRoutes || status == nil {
+		return false
+	}
+	for _, peer := range status.Peer {
+		if peer == nil {
+			continue
+		}
+		for _, p := range prefixList(peer.PrimaryRoutes) {
+			if p.Bits() > 0 && p.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func formatIPList(ips []netip.Addr) string {
+	parts := make([]string, len(ips))
+	for i, ip := range ips {
+		parts[i] = ip.Unmap().String()
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (d *tailnetDialer) resolveAddr(ctx context.Context, network, addr string) (resolvedAddr string, resolved bool, err error) {
@@ -409,10 +606,29 @@ func (d *tailnetDialer) resolveAddr(ctx context.Context, network, addr string) (
 		return "", false, err
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return net.JoinHostPort(ip.String(), port), true, nil
+		if !d.tailnetOnly {
+			return net.JoinHostPort(ip.String(), port), true, nil
+		}
+		norm := ip.Unmap()
+		if isAllowedTailnetIP(norm, nil, false) {
+			return net.JoinHostPort(norm.String(), port), true, nil
+		}
+		var status *ipnstate.Status
+		if d.acceptRoutes {
+			var statusErr error
+			status, statusErr = d.fetchStatus(ctx)
+			if statusErr != nil {
+				slog.Debug("tailnet status lookup failed during -tailnet-only check", slog.String("host", host), slog.Any("error", statusErr))
+				status = nil
+			}
+		}
+		if !isAllowedTailnetIP(norm, status, d.acceptRoutes) {
+			return "", false, fmt.Errorf("destination %q (%s) blocked by -tailnet-only", host, norm)
+		}
+		return net.JoinHostPort(norm.String(), port), true, nil
 	}
 
-	status, statusErr := d.lc.Status(ctx)
+	status, statusErr := d.fetchStatus(ctx)
 	if statusErr != nil {
 		slog.Debug("tailnet status lookup failed", slog.String("host", host), slog.Any("error", statusErr))
 	}
@@ -430,6 +646,9 @@ func (d *tailnetDialer) resolveAddr(ctx context.Context, network, addr string) (
 		}
 	}
 	if err != nil {
+		if d.tailnetOnly {
+			return "", false, fmt.Errorf("destination %q blocked by -tailnet-only: tailnet DNS lookup failed: %w", host, err)
+		}
 		if d.isStrictTailnetHost(status, host) {
 			return "", false, fmt.Errorf("tailnet DNS lookup for %q: %w", host, err)
 		}
@@ -440,13 +659,31 @@ func (d *tailnetDialer) resolveAddr(ctx context.Context, network, addr string) (
 		return "", false, nil
 	}
 	if len(ips) == 0 {
+		if d.tailnetOnly {
+			return "", false, fmt.Errorf("destination %q blocked by -tailnet-only: DNS lookup returned no addresses", host)
+		}
 		if d.isStrictTailnetHost(status, host) {
 			return "", false, fmt.Errorf("tailnet DNS lookup for %q returned no addresses", host)
 		}
 		return "", false, nil
 	}
 
-	resolvedAddr = net.JoinHostPort(ips[0].String(), port)
+	chosen := ips[0]
+	if d.tailnetOnly {
+		var allowed netip.Addr
+		for _, ip := range ips {
+			if isAllowedTailnetIP(ip, status, d.acceptRoutes) {
+				allowed = ip.Unmap()
+				break
+			}
+		}
+		if !allowed.IsValid() {
+			return "", false, fmt.Errorf("destination %q (%s) blocked by -tailnet-only", host, formatIPList(ips))
+		}
+		chosen = allowed
+	}
+
+	resolvedAddr = net.JoinHostPort(chosen.String(), port)
 	slog.Debug("tailnet DNS resolved",
 		slog.String("host", host),
 		slog.String("network", network),
@@ -543,7 +780,7 @@ func (d *tailnetDialer) isStrictTailnetHost(status *ipnstate.Status, host string
 	if !strings.Contains(hostKey, ".") {
 		return true
 	}
-	suffixes := append(append([]string{}, magicDNSSuffixes(status)...), d.suffixes...)
+	suffixes := append(append([]string{}, magicDNSSuffixes(status)...), d.getSuffixes()...)
 	for _, suffix := range suffixes {
 		suffixKey := dnsMapKey(suffix)
 		if suffixKey != "" && (hostKey == suffixKey || strings.HasSuffix(hostKey, "."+suffixKey)) {
@@ -572,7 +809,7 @@ func (d *tailnetDialer) lookupIP(ctx context.Context, network, host string) ([]n
 	var ips []netip.Addr
 	var errs []error
 	for _, queryType := range queryTypesForNetwork(network) {
-		response, resolvers, err := d.lc.QueryDNS(ctx, dnsQueryName(host), queryType)
+		response, resolvers, err := d.queryDNS(ctx, dnsQueryName(host), queryType)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s query: %w", queryType, err))
 			continue
@@ -838,11 +1075,16 @@ func checkLoopbackListeners() error {
 	if *flagAllowNonLoopback {
 		return nil
 	}
-	for _, l := range []struct{ flag, addr string }{
+	type listenerEntry struct{ flag, addr string }
+	listeners := []listenerEntry{
 		{"-socks5", *flagSOCKS5Addr},
 		{"-http", *flagHTTPAddr},
 		{"-pac-addr", *flagPACAddr},
-	} {
+	}
+	for _, f := range flagForwards {
+		listeners = append(listeners, listenerEntry{"-L", f.local})
+	}
+	for _, l := range listeners {
 		if l.addr != "" && !isLoopbackListenAddr(l.addr) {
 			return fmt.Errorf("refusing non-loopback listener %s %s without -allow-non-loopback", l.flag, l.addr)
 		}

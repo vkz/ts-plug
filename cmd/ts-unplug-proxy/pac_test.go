@@ -1,8 +1,13 @@
 package main
 
 import (
+	"io"
+	"net"
+	"net/http"
 	"os/exec"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -152,5 +157,96 @@ func TestIsLoopbackListenAddr(t *testing.T) {
 		if got := isLoopbackListenAddr(tc.in); got != tc.want {
 			t.Errorf("isLoopbackListenAddr(%q) = %v, want %v", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestPACBaselineEmptySuffixesFailClosed(t *testing.T) {
+	cfg := pacConfig{
+		suffixes: nil,
+		proxies:  []string{"PROXY 127.0.0.1:8080"},
+	}
+	if got := cfg.effectiveSuffixes(); !slices.Equal(got, []string{"ts.net"}) {
+		t.Fatalf("effectiveSuffixes = %v, want [ts.net]", got)
+	}
+	for _, host := range []string{"foo.ts.net", "gxa.wild-dojo.ts.net", "100.64.1.2", "fd7a:115c:a1e0::1"} {
+		if got := kind(cfg.match(host)); got != "proxy" {
+			t.Errorf("baseline match(%q) = %s, want proxy", host, got)
+		}
+	}
+	for _, host := range []string{"example.com", "10.0.0.1"} {
+		if got := kind(cfg.match(host)); got != "direct" {
+			t.Errorf("baseline match(%q) = %s, want direct", host, got)
+		}
+	}
+}
+
+func TestMergeSuffixes(t *testing.T) {
+	got := mergeSuffixes(
+		[]string{"corp.internal.", "Wild-Dojo.ts.net"},
+		[]string{"wild-dojo.ts.net.", "extra.ts.net", "  "},
+	)
+	want := []string{"corp.internal", "wild-dojo.ts.net", "extra.ts.net"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("mergeSuffixes = %v, want %v", got, want)
+	}
+}
+
+func TestPACHolderAtomicSwapAndLiveServer(t *testing.T) {
+	proxies := []string{"PROXY 127.0.0.1:8080"}
+	holder := newPACHolder(pacConfig{suffixes: nil, proxies: proxies})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	status := &statusState{hostname: "pac-test", proxies: proxies}
+	serveErr := make(chan serveResult, 1)
+	startPACServer(ln, holder, status, true, false, serveErr)
+
+	fetchPAC := func() string {
+		t.Helper()
+		resp, err := http.Get("http://" + ln.Addr().String() + "/proxy.pac")
+		if err != nil {
+			t.Fatalf("GET /proxy.pac: %v", err)
+		}
+		defer resp.Body.Close()
+		bs, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read /proxy.pac: %v", err)
+		}
+		return string(bs)
+	}
+
+	before := fetchPAC()
+	if !strings.Contains(before, `"ts.net"`) {
+		t.Fatalf("pre-update PAC missing ts.net:\n%s", before)
+	}
+	if strings.Contains(before, `"corp.example.internal"`) {
+		t.Fatalf("pre-update PAC unexpectedly contains corp.example.internal")
+	}
+
+	// Concurrently read and update under -race.
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_ = holder.Script()
+				_ = holder.Config()
+			}
+		}()
+	}
+	holder.Update(pacConfig{
+		suffixes: []string{"corp.example.internal", "wild-dojo.ts.net"},
+		proxies:  proxies,
+	})
+	wg.Wait()
+
+	after := fetchPAC()
+	if !strings.Contains(after, `"corp.example.internal"`) || !strings.Contains(after, `"wild-dojo.ts.net"`) {
+		t.Fatalf("post-update PAC missing dynamically discovered suffixes:\n%s", after)
 	}
 }

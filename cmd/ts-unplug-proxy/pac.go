@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // cgnatPrefix is Tailscale's IPv4 address space (RFC 6598 CGNAT). Node IPs and
@@ -27,21 +29,68 @@ func (c pacConfig) proxyList() string { return strings.Join(c.proxies, "; ") }
 // name can resolve publicly, so tailnet-named traffic must never fall through
 // to DIRECT.
 func (c pacConfig) effectiveSuffixes() []string {
+	return mergeSuffixes(c.suffixes, []string{"ts.net"})
+}
+
+// mergeSuffixes normalizes (lower-case, trimmed, no trailing dot) and
+// de-duplicates DNS suffixes across groups while preserving group order.
+func mergeSuffixes(groups ...[]string) []string {
 	seen := map[string]bool{}
 	var out []string
-	add := func(s string) {
-		s = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
-		if s == "" || seen[s] {
-			return
+	for _, group := range groups {
+		for _, s := range group {
+			s = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			out = append(out, s)
 		}
-		seen[s] = true
-		out = append(out, s)
 	}
-	for _, s := range c.suffixes {
-		add(s)
-	}
-	add("ts.net")
 	return out
+}
+
+type pacState struct {
+	cfg    pacConfig
+	script string
+}
+
+// pacHolder stores the live PAC configuration and rendered script behind an
+// atomic pointer so dynamic MagicDNS suffix discovery can swap /proxy.pac
+// without locks or data races.
+type pacHolder struct {
+	state atomic.Pointer[pacState]
+}
+
+func newPACHolder(cfg pacConfig) *pacHolder {
+	h := &pacHolder{}
+	h.Update(cfg)
+	return h
+}
+
+func (h *pacHolder) Update(cfg pacConfig) {
+	cloned := pacConfig{
+		suffixes: slices.Clone(cfg.suffixes),
+		proxies:  slices.Clone(cfg.proxies),
+	}
+	h.state.Store(&pacState{
+		cfg:    cloned,
+		script: cloned.script(),
+	})
+}
+
+func (h *pacHolder) Script() string {
+	if st := h.state.Load(); st != nil {
+		return st.script
+	}
+	return ""
+}
+
+func (h *pacHolder) Config() pacConfig {
+	if st := h.state.Load(); st != nil {
+		return st.cfg
+	}
+	return pacConfig{}
 }
 
 // script renders the PAC file served at /proxy.pac.
@@ -116,17 +165,17 @@ func jsStringList(items []string) string {
 
 // startPACServer serves the PAC file and a JSON status document on an
 // already-created listener.
-func startPACServer(listener net.Listener, script string, status *statusState, verbose bool, serveErr chan<- serveResult) {
+func startPACServer(listener net.Listener, holder *pacHolder, status *statusState, includeAuthURL bool, verbose bool, serveErr chan<- serveResult) {
 	mux := http.NewServeMux()
 	serve := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
 		w.Header().Set("Cache-Control", "no-store")
-		if _, err := io.WriteString(w, script); err != nil && verbose {
+		if _, err := io.WriteString(w, holder.Script()); err != nil && verbose {
 			slog.Debug("pac write failed", slog.Any("error", err))
 		}
 	}
 	mux.HandleFunc("/proxy.pac", serve)
-	mux.HandleFunc("/status", statusHandler(status))
+	mux.HandleFunc("/status", statusHandler(status, includeAuthURL))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

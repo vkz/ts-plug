@@ -33,6 +33,7 @@ type doctor struct {
 	httpAddr         string
 	pacAddr          string
 	pacDomains       []string
+	forwards         forwardList
 	allowNonLoopback bool
 
 	problems int
@@ -76,6 +77,7 @@ func runDoctor() int {
 		httpAddr:         *flagHTTPAddr,
 		pacAddr:          *flagPACAddr,
 		pacDomains:       splitCommaList(*flagPACDomains),
+		forwards:         append(forwardList(nil), flagForwards...),
 		allowNonLoopback: *flagAllowNonLoopback,
 	}
 	fmt.Println("ts-unplug-proxy doctor")
@@ -141,11 +143,16 @@ func (d *doctor) checkState() {
 }
 
 func (d *doctor) checkListeners() {
-	for _, l := range []struct{ flag, addr string }{
+	type listenerEntry struct{ flag, addr string }
+	listeners := []listenerEntry{
 		{"-socks5", d.socksAddr},
 		{"-http", d.httpAddr},
 		{"-pac-addr", d.pacAddr},
-	} {
+	}
+	for _, f := range d.forwards {
+		listeners = append(listeners, listenerEntry{"-L", f.local})
+	}
+	for _, l := range listeners {
 		if l.addr == "" {
 			continue
 		}
@@ -158,8 +165,8 @@ func (d *doctor) checkListeners() {
 			d.fail("%s %s is NOT loopback and -allow-non-loopback is not set", l.flag, l.addr)
 		}
 	}
-	if d.socksAddr == "" && d.httpAddr == "" {
-		d.fail("no -socks5 or -http listener configured (a PAC alone has nothing to route to)")
+	if d.socksAddr == "" && d.httpAddr == "" && len(d.forwards) == 0 {
+		d.fail("no -socks5, -http, or -L listener configured")
 	}
 }
 
@@ -177,8 +184,7 @@ func (d *doctor) checkPAC() {
 		}
 	}
 	if len(domains) == 0 {
-		d.fail("-pac-addr is set but no -pac-domain and no MagicDNS suffix in state")
-		return
+		d.warn("no -pac-domain and no MagicDNS suffix in state yet; MagicDNS will be discovered dynamically at runtime (baseline .ts.net and CGNAT still fail closed)")
 	}
 	cfg := pacConfig{suffixes: domains, proxies: pacProxies(d.socksAddr, d.httpAddr)}
 	if cfg.proxyList() == "" {
@@ -189,18 +195,26 @@ func (d *doctor) checkPAC() {
 	d.info("suffixes: %s", strings.Join(cfg.effectiveSuffixes(), ", "))
 	// Fail-closed must hold for tailnet names and CGNAT literals; only
 	// unmatched hosts may go DIRECT.
-	samples := []struct {
+	type sample struct {
 		host string
 		want string
-	}{
-		{domains[0], "proxy"},
-		{"gxa." + domains[0], "proxy"},
-		{"100.64.1.1", "proxy"},
-		{"100.127.255.254", "proxy"},
-		{"example.com", "direct"},
-		{"100.63.255.255", "direct"},
-		{"100.128.0.1", "direct"},
 	}
+	var samples []sample
+	if len(domains) > 0 {
+		samples = append(samples,
+			sample{domains[0], "proxy"},
+			sample{"gxa." + domains[0], "proxy"},
+		)
+	}
+	samples = append(samples,
+		sample{"example.ts.net", "proxy"},
+		sample{"100.64.1.1", "proxy"},
+		sample{"100.127.255.254", "proxy"},
+		sample{"fd7a:115c:a1e0::1", "proxy"},
+		sample{"example.com", "direct"},
+		sample{"100.63.255.255", "direct"},
+		sample{"100.128.0.1", "direct"},
+	)
 	for _, s := range samples {
 		got := "direct"
 		if cfg.match(s.host) != "DIRECT" {
