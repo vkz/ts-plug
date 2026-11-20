@@ -70,6 +70,23 @@ func startControlServer(ctx context.Context, listener net.Listener, localDial fu
 	}()
 }
 
+// defaultStateDir returns the default state directory for CLI subcommands:
+// $TS_UNPLUG_PROXY_DIR, or ${XDG_STATE_HOME:-~/.local/state}/ts-unplug-proxy.
+func defaultStateDir() (string, error) {
+	if d := strings.TrimSpace(os.Getenv("TS_UNPLUG_PROXY_DIR")); d != "" {
+		return d, nil
+	}
+	stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	if stateHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("determine home directory for default state dir: %w", err)
+		}
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(stateHome, "ts-unplug-proxy"), nil
+}
+
 // resolveControlSocket locates the control Unix socket using the precedence:
 //  1. flagSock (if non-empty)
 //  2. filepath.Join(flagDir, "control.sock") (if flagDir non-empty)
@@ -86,18 +103,11 @@ func resolveControlSocket(flagSock, flagDir string) (string, error) {
 	if s := strings.TrimSpace(os.Getenv("TS_UNPLUG_PROXY_SOCK")); s != "" {
 		return s, nil
 	}
-	if d := strings.TrimSpace(os.Getenv("TS_UNPLUG_PROXY_DIR")); d != "" {
-		return filepath.Join(d, "control.sock"), nil
+	dir, err := defaultStateDir()
+	if err != nil {
+		return "", err
 	}
-	stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
-	if stateHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("determine home directory for default control socket: %w", err)
-		}
-		stateHome = filepath.Join(home, ".local", "state")
-	}
-	return filepath.Join(stateHome, "ts-unplug-proxy", "control.sock"), nil
+	return filepath.Join(dir, "control.sock"), nil
 }
 
 // controlLocalClient returns a Tailscale LocalAPI client pointed at the

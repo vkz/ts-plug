@@ -27,6 +27,7 @@ var tailnetV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 // (i.e. no proxy is running).
 type doctor struct {
 	dir              string
+	controlSock      string
 	hostname         string
 	hostnameSet      bool
 	advertiseTags    []string
@@ -38,6 +39,7 @@ type doctor struct {
 	forwards         forwardList
 	allowNonLoopback bool
 	uninitialized    bool
+	discoveredLive   string
 
 	problems int
 	warnings int
@@ -72,6 +74,7 @@ func runDoctor() int {
 	})
 	d := &doctor{
 		dir:              *flagDir,
+		controlSock:      *flagControlSock,
 		hostname:         strings.TrimSpace(*flagHostname),
 		hostnameSet:      hostnameSet,
 		advertiseTags:    tags,
@@ -83,6 +86,7 @@ func runDoctor() int {
 		forwards:         append(forwardList(nil), flagForwards...),
 		allowNonLoopback: *flagAllowNonLoopback,
 	}
+	d.populateFromRunningDaemon()
 	fmt.Println("ts-unplug-proxy doctor")
 	d.section("state")
 	d.checkState()
@@ -150,7 +154,40 @@ func (d *doctor) checkState() {
 	}
 }
 
+// populateFromRunningDaemon queries the daemon's control socket when the
+// caller did not specify listener flags explicitly, so bare `doctor` inspects
+// the live daemon's actual listeners instead of reporting "none configured".
+func (d *doctor) populateFromRunningDaemon() {
+	if d.socksAddr != "" || d.httpAddr != "" || len(d.forwards) > 0 {
+		return
+	}
+	sockPath, err := resolveControlSocket(d.controlSock, d.dir)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	doc, err := fetchControlStatus(ctx, sockPath)
+	if err != nil {
+		return
+	}
+	d.discoveredLive = sockPath
+	d.socksAddr = doc.SOCKS5Addr
+	d.httpAddr = doc.HTTPAddr
+	for _, raw := range doc.Forwards {
+		if spec, err := parseForwardSpec(raw); err == nil {
+			d.forwards = append(d.forwards, spec)
+		}
+	}
+	if len(d.pacDomains) == 0 && len(doc.Suffixes) > 0 {
+		d.pacDomains = append([]string(nil), doc.Suffixes...)
+	}
+}
+
 func (d *doctor) checkListeners() {
+	if d.discoveredLive != "" {
+		d.info("discovered listeners from running daemon (%s)", d.discoveredLive)
+	}
 	type listenerEntry struct{ flag, addr string }
 	listeners := []listenerEntry{
 		{"-socks5", d.socksAddr},
@@ -174,7 +211,11 @@ func (d *doctor) checkListeners() {
 		}
 	}
 	if d.socksAddr == "" && d.httpAddr == "" && len(d.forwards) == 0 {
-		d.fail("no -socks5, -http, or -L listener configured")
+		if d.pacAddr != "" {
+			d.fail("no -socks5 or -http listener configured (a PAC alone has nothing to route to)")
+		} else {
+			d.info("no listener flags passed and no running daemon detected (pass -socks5/-http/-L to validate listeners)")
+		}
 	}
 }
 

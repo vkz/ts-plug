@@ -687,4 +687,57 @@ func TestDoctorCheckListenersIncludesForwards(t *testing.T) {
 	if dBad.problems == 0 {
 		t.Error("non-loopback -L without -allow-non-loopback should fail")
 	}
+
+	// Offline doctor without listener flags or -pac-addr should not fail.
+	dOffline := &doctor{}
+	dOffline.checkListeners()
+	if dOffline.problems != 0 {
+		t.Errorf("offline doctor with no listener flags: problems = %d, want 0", dOffline.problems)
+	}
+
+	// -pac-addr alone with no proxy listener must still fail.
+	dPACOnly := &doctor{pacAddr: "127.0.0.1:8099"}
+	dPACOnly.checkListeners()
+	if dPACOnly.problems == 0 {
+		t.Error("doctor with -pac-addr only should fail")
+	}
+}
+
+func TestDoctorPopulateFromRunningDaemon(t *testing.T) {
+	sockPath := shortSockPath(t, "doc.sock")
+	ln, err := listenControlSocket(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	st := &statusState{
+		hostname:    "doc-proxy",
+		socks5Addr:  "127.0.0.1:1080",
+		httpAddr:    "127.0.0.1:8080",
+		controlSock: sockPath,
+		forwards:    []string{"127.0.0.1:7687=neo4j.wild-dojo.ts.net:7687"},
+		suffixes:    []string{"wild-dojo.ts.net"},
+		proxies:     []string{"PROXY 127.0.0.1:8080", "SOCKS5 127.0.0.1:1080"},
+	}
+	st.setServing()
+	srv := &http.Server{Handler: newControlMux(nil, st, newConnTracker())}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	d := &doctor{controlSock: sockPath}
+	d.populateFromRunningDaemon()
+	if d.discoveredLive != sockPath {
+		t.Fatalf("discoveredLive = %q, want %q", d.discoveredLive, sockPath)
+	}
+	if d.socksAddr != "127.0.0.1:1080" || d.httpAddr != "127.0.0.1:8080" {
+		t.Errorf("discovered socks/http = %q/%q, want 127.0.0.1:1080/127.0.0.1:8080", d.socksAddr, d.httpAddr)
+	}
+	if len(d.forwards) != 1 || d.forwards[0].local != "127.0.0.1:7687" {
+		t.Errorf("discovered forwards = %+v, want 127.0.0.1:7687", d.forwards)
+	}
+	d.checkListeners()
+	if d.problems != 0 {
+		t.Errorf("checkListeners on discovered live listeners: problems = %d, want 0", d.problems)
+	}
 }

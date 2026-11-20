@@ -157,8 +157,17 @@ func main() {
 		return
 	}
 	if *flagDir == "" {
-		slog.Error("-dir is required")
-		os.Exit(1)
+		if doctorMode {
+			dir, err := defaultStateDir()
+			if err != nil {
+				slog.Error("cannot determine default state dir (pass -dir)", slog.Any("error", err))
+				os.Exit(1)
+			}
+			*flagDir = dir
+		} else {
+			slog.Error("-dir is required")
+			os.Exit(1)
+		}
 	}
 	if flag.NArg() != 0 {
 		slog.Error("positional remote addresses are not supported; proxy clients provide destinations")

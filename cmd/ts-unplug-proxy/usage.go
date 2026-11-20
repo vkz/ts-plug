@@ -170,10 +170,12 @@ EXAMPLES
 const doctorUsageText = `ts-unplug-proxy doctor - diagnose state dir, persisted prefs, listeners, PAC, and routes.
 
 USAGE
-  ts-unplug-proxy doctor -dir <state-dir> [options]
+  ts-unplug-proxy doctor [options]
 
 OPTIONS
-  -dir <path>                 tsnet state directory (required)
+  -dir <path>                 tsnet state directory (default: $TS_UNPLUG_PROXY_DIR
+                              or ${XDG_STATE_HOME:-~/.local/state}/ts-unplug-proxy)
+  -control-sock <path>        override Unix control socket for live listener discovery
   -socks5 <addr>              SOCKS5 listener address to validate
   -http <addr>                HTTP proxy listener address to validate
   -L <local=remote>           static TCP forward to validate (repeatable)
